@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "blender": {
+      "command": "python3",
+      "args": ["-m", "mcp_server"],
+      "cwd": "/Users/panta/Desktop/claudeblender/claude_blender",
+      "env": {
+        "BLENDER_HOST": "127.0.0.1",
+        "BLENDER_PORT": "9876"
+      }
+    }
+  }
+}

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-blender"
+version = "0.1.0"
+description = "Claude Code MCP server for Blender integration"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Claude Blender Contributors"}
+]
+keywords = ["blender", "claude", "mcp", "ai", "3d"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+ai = [
+    "httpx>=0.25.0",
+    "replicate>=0.20.0",
+]
+
+[project.scripts]
+claude-blender = "mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/example/claude-blender"
+Documentation = "https://github.com/example/claude-blender#readme"
+Repository = "https://github.com/example/claude-blender"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_server*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
