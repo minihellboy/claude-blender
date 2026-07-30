@@ -11,9 +11,9 @@ The prompt:
 ## 1. Subject prep
 
 ```
-blender_add_object   monkey → "Demo_Suzanne"
-blender_modifier     action=add SUBSURF {levels: 2, render_levels: 3}
-blender_execute      shade smooth + rotate 18° for a three-quarter pose
+blender_add_object     monkey → "Demo_Suzanne"
+blender_modifier       action=add SUBSURF {levels: 2, render_levels: 3}
+blender_modify_object  shade_smooth=true, rotation for a three-quarter pose
 blender_create_material  "Copper": base [0.83, 0.42, 0.26], metallic 1.0, roughness 0.32
 ```
 
@@ -22,6 +22,8 @@ sculpture in the final image — and `blender_get_object` shows the polygon
 count so you can verify it took effect.
 
 ## 2. Lighting (three-point, scaled to the subject)
+
+Each light is one `blender_add_object` call with `energy`, `color`, `size`:
 
 - **Key**: warm 800 W area light, 5 m, high front-left
 - **Fill**: neutral 300 W area, 6 m, low front-right (half-ish key power,

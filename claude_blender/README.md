@@ -13,13 +13,14 @@ uv sync
 ```
 
 ### Test Connection
+From the repository root:
 ```bash
-uv run python test_client.py
+uv run python claude_blender/test_client.py
 ```
 
 ### Interactive Mode
 ```bash
-uv run python test_client.py -i
+uv run python claude_blender/test_client.py -i
 ```
 
 ## Package Structure

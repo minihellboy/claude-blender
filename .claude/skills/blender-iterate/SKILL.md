@@ -1,6 +1,7 @@
 ---
 name: blender-iterate
 description: Iteratively build or refine a Blender scene toward a visual goal using render-critique loops. Use when the user describes a desired look ("make it moodier", "build a cozy campfire scene") rather than a single concrete edit.
+argument-hint: <visual goal>
 ---
 
 # Blender visual iteration loop
@@ -36,6 +37,7 @@ image, and adjusting — like a sculptor stepping back after every pass.
 ## Finish
 
 - Final render: `blender_render` with CYCLES, 1920x1080, 128+ samples.
+- Offer `blender_save` - renders don't persist the scene; only saving does.
 - Report what changed each round and show the final image path.
 - If 4 rounds weren't enough, show the best draft, list what still falls
   short, and ask the user how to proceed.

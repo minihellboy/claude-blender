@@ -13,7 +13,7 @@ Control Blender through natural language, execute Python scripts, generate 3D co
 
 ### Core Features
 - **Natural Language Control**: Control Blender via Claude Code commands
-- **MCP Integration**: Built on MCP SDK v2 (protocol 2026-07-28) — 27 tools, 3 resources, and workflow prompts, with tool annotations and structured output
+- **MCP Integration**: Built on MCP SDK v2 (protocol 2026-07-28) — 28 tools, 3 resources, and workflow prompts, with tool annotations and structured output
 - **Visual Feedback Loop**: Screenshots and renders come back inline so Claude can see, critique, and iterate on its own work
 - **Import / Export**: OBJ, STL, PLY, FBX, glTF/GLB, USD, Collada, Alembic
 - **Animation Rendering**: MP4 turntables and image sequences with inline preview stills
@@ -73,22 +73,33 @@ Control Blender through natural language, execute Python scripts, generate 3D co
 
 ### 1. Install the Blender Addon
 
-**Option A: Install from folder**
-1. In Blender, go to **Edit > Preferences > Add-ons**
-2. Click **Install...**
-3. Navigate to `claude_blender/blender_addon/` and select the folder
-4. Enable the addon by checking the box
-
-**Option B: Symlink for development**
+**Option A: Symlink (recommended when working from a clone — picks up edits)**
 ```bash
-# macOS
-ln -s /path/to/claudeblender/claude_blender/blender_addon \
-      ~/Library/Application\ Support/Blender/4.3/scripts/addons/claude_blender
+# macOS (replace <version> with your Blender version, e.g. 4.3)
+ln -s /path/to/claude-blender/claude_blender/blender_addon \
+      ~/Library/Application\ Support/Blender/<version>/scripts/addons/claude_blender
 
 # Linux
-ln -s /path/to/claudeblender/claude_blender/blender_addon \
-      ~/.config/blender/4.3/scripts/addons/claude_blender
+ln -s /path/to/claude-blender/claude_blender/blender_addon \
+      ~/.config/blender/<version>/scripts/addons/claude_blender
 ```
+The link **must** be named `claude_blender` — that name becomes the addon's
+Python module name, which the headless script and the AI tools rely on.
+Then enable "Claude Blender" in **Edit > Preferences > Add-ons**.
+
+**Option B: Install from zip**
+
+Blender's installer accepts only `.py`/`.zip` files (not folders), so build
+the zip first:
+```bash
+./scripts/build_addon.sh
+```
+Then **Edit > Preferences > Add-ons > ∨ (dropdown) > Install from Disk...**
+and select `claude_blender.zip`. The script pins the in-zip folder name to
+`claude_blender` for the same module-name reason as above.
+
+The addon auto-starts its server on launch (toggle in the addon
+preferences; the toggle takes effect immediately).
 
 ### 2. Install the MCP Server
 
@@ -114,10 +125,14 @@ claude mcp add --scope user blender \
 
 ### 4. Start the Server in Blender
 
-1. Open Blender
-2. Press **N** to show the sidebar
-3. Go to **Claude** tab
-4. Click **Start Server**
+With auto-start enabled (the default), just open Blender. Otherwise:
+
+1. Press **N** to show the sidebar
+2. Go to the **Claude** tab
+3. Click **Start Server**
+
+The panel reads the real server state (it survives File > New/Open), and a
+failed start reports the reason — e.g. which process holds the port.
 
 ## Usage
 
@@ -167,6 +182,10 @@ and all object tools work; only viewport screenshots and undo need the GUI:
 
 ```bash
 blender --background --python scripts/headless_blender.py -- --port 9876
+
+# macOS: the default install doesn't put blender on PATH
+/Applications/Blender.app/Contents/MacOS/Blender --background \
+    --python scripts/headless_blender.py -- --port 9876
 ```
 
 ### Tests
@@ -202,8 +221,8 @@ uv run python claude_blender/test_client.py -i
 ### Object Tools
 | Tool | Description |
 |------|-------------|
-| `blender_add_object` | Add primitive (cube, sphere, etc.) |
-| `blender_modify_object` | Transform object (location, rotation, scale) |
+| `blender_add_object` | Add primitive (cube, sphere, lights with energy/color/size, etc.) |
+| `blender_modify_object` | Transform object, visibility, smooth/flat shading |
 | `blender_delete_object` | Delete object by name |
 
 ### Code Execution
@@ -215,8 +234,9 @@ uv run python claude_blender/test_client.py -i
 | Tool | Description |
 |------|-------------|
 | `blender_screenshot` | Capture viewport — returns the image inline so Claude can see it |
-| `blender_render` | Render scene — returns the image inline so Claude can see it |
+| `blender_render` | Render scene — defaults are a fast draft; renders never leak settings into the scene |
 | `blender_render_animation` | Render MP4 video or PNG sequence — returns preview stills inline |
+| `blender_save` | Save the .blend file (in place or as a copy) |
 
 ### Camera
 | Tool | Description |
@@ -246,7 +266,7 @@ uv run python claude_blender/test_client.py -i
 | Tool | Description |
 |------|-------------|
 | `blender_create_material` | Create and assign materials |
-| `blender_set_keyframe` | Set animation keyframes |
+| `blender_set_keyframe` | Set animation keyframes (with easing, e.g. LINEAR for loops) |
 | `blender_set_frame_range` | Set animation frame range |
 
 ### Local AI Generation
@@ -326,8 +346,10 @@ claude-blender/
 │   ├── test_client.py           # Raw JSON-RPC test script
 │   └── demo_creative.py         # Creative demo script
 │
-├── tests/                       # pytest suite (fake Blender + live markers)
-├── scripts/headless_blender.py  # Serve the addon from blender --background
+├── tests/                       # pytest suite (fake Blender, fake bpy, live markers)
+├── scripts/
+│   ├── headless_blender.py      # Serve the addon from blender --background
+│   └── build_addon.sh           # Build claude_blender.zip for Install from Disk
 ├── examples/                    # Walkthroughs with real committed renders
 ├── .claude/skills/              # /blender-iterate, /blender-studio-shot, /blender-turntable
 ├── .github/workflows/ci.yml     # uv + pytest on 3.11/3.13

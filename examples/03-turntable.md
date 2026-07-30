@@ -23,13 +23,12 @@ orbits, so the subject's forms are revealed as it turns.
 
 ```
 blender_set_frame_range  1 → 36            (1.5 s at 24 fps)
-blender_set_keyframe     Demo_Pivot frame 1  rotation [0, 0, 0]
-blender_set_keyframe     Demo_Pivot frame 36 rotation [0, 0, 6.28319]
-blender_execute          set keyframe interpolation to LINEAR
+blender_set_keyframe     Demo_Pivot frame 1  rotation [0, 0, 0]        interpolation=LINEAR
+blender_set_keyframe     Demo_Pivot frame 36 rotation [0, 0, 6.28319]  interpolation=LINEAR
 ```
 
-The LINEAR step matters: Blender eases keyframes in/out by default, which
-makes a looping turntable visibly stutter at the seam.
+LINEAR matters: Blender eases keyframes in/out by default, which makes a
+looping turntable visibly stutter at the seam.
 
 ## Render + review without watching
 

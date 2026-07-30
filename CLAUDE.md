@@ -10,12 +10,12 @@ MCP client (Claude Code)
    │  stdio, MCP protocol 2026-07-28 (SDK v2, stateless)
    ▼
 claude_blender/claude_blender_mcp/     ← runs OUTSIDE Blender (uv project)
-   server.py          27 tools, 3 resources, 2 prompts (MCPServer)
+   server.py          28 tools, 3 resources, 2 prompts (MCPServer)
    blender_client.py  async JSON-RPC client, per-call timeouts
    │  newline-delimited JSON-RPC 2.0 over TCP 127.0.0.1:9876
    ▼
 claude_blender/blender_addon/          ← runs INSIDE Blender (addon)
-   core/server.py       timer-polled TCP server (60 Hz)
+   core/server.py       timer-polled TCP server (60 Hz, buffered writes)
    core/protocol.py     JSON-RPC dispatch → registered methods
    core/executor.py     exec/operators/modifiers/duplicate/undo
    core/scene_utils.py  introspection, render, render_animation
@@ -38,12 +38,22 @@ claude_blender/blender_addon/          ← runs INSIDE Blender (addon)
 4. **Timeout ⇒ disconnect.** `BlenderClient.call()` drops the connection on
    timeout so a late reply can never be consumed by the next request. Keep
    that behavior when touching the client.
-5. **Render settings are global scene state.** Any handler that renders must
-   re-assert every setting it depends on (`file_format`, resolution,
-   `resolution_percentage`) — a previous call may have left anything behind.
-6. **New RPC methods** go in `_setup_handler()` (addon `__init__.py`) AND get
+5. **Render settings are per-call overrides, never scene mutations.** Any
+   handler that touches render state must run inside
+   `scene_utils._render_state(scene)` — it re-asserts what the call needs
+   and restores the user's configuration on success AND failure (engine,
+   resolution, format, filepath, fps, samples, playhead).
+6. **Socket writes must go through the server's output buffer**
+   (`_queue_send`) — a bare `send()` on the non-blocking socket silently
+   truncates large responses.
+7. **New RPC methods** go in `_setup_handler()` (addon `__init__.py`) AND get
    a fake handler in `tests/conftest.py` (`_h_<method>`), or protocol tests
    will fail with "unknown method".
+8. **Tool-surface docs move together.** When a tool's parameters change,
+   update in one pass: the MCP prompts (`server.py`), the skills
+   (`.claude/skills/`), the examples (`examples/`), and the README tool
+   tables — they intentionally describe the same workflows at different
+   depths, and drift between them misleads agents.
 
 ## Commands
 

@@ -1,6 +1,7 @@
 ---
 name: blender-studio-shot
 description: Produce a studio-quality product shot of an object in the Blender scene - three-point lighting, camera framing, backdrop, and a final Cycles render. Use when the user wants a clean presentation image of a model.
+argument-hint: [object-name]
 ---
 
 # Studio product shot
@@ -18,10 +19,13 @@ Produce a studio-quality hero shot of the object named in `$ARGUMENTS`
    smooth curved sweep behind the subject if the look calls for an infinity
    cove (`blender_execute` with a curved plane or a big soft-material plane
    is fine). Neutral material: roughness 0.9, color light gray.
-4. **Three-point lighting**, scaled to D and the subject's height:
-   - Key: AREA light, ~45° front-left, elevated, size ≈ D (soft shadows).
-   - Fill: AREA light front-right, half the key's power, larger and softer.
-   - Rim: light behind/above the subject to separate it from the backdrop.
+4. **Three-point lighting**, scaled to D and the subject's height — each is
+   one `blender_add_object` call with `energy`, `color`, and `size`:
+   - Key: `area`, ~45° front-left, elevated, size ≈ D, warm color,
+     energy ~800 (soft shadows come from size).
+   - Fill: `area`, front-right, half the key's energy, size ≈ 1.5×D.
+   - Rim: behind/above the subject, cool color, to separate it from the
+     backdrop.
 5. **Frame**: `blender_frame_camera` targeting the subject —
    `azimuth_deg` ~30-45, `elevation_deg` ~15-25, `lens` 85, `margin` 1.2.
 6. **Draft loop** (2-3 rounds): `blender_render` at 640x360, CYCLES,
