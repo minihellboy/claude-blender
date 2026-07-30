@@ -7,7 +7,7 @@ No external API calls.
 
 Supported models:
     - TripoSR: Fast feed-forward image-to-3D (Stability AI)
-    - InstantMesh: High quality multi-view reconstruction
+    - Depth2Mesh: depth estimation converted to a relief mesh
 
 Requirements:
     pip install torch torchvision torchaudio
@@ -190,59 +190,6 @@ class LocalTripoSR(BaseLocalService, ModelOutputMixin):
             return {"success": False, "error": str(e)}
 
 
-class LocalInstantMesh(BaseLocalService, ModelOutputMixin):
-    """
-    Local InstantMesh image-to-3D service.
-
-    InstantMesh generates multi-view images and reconstructs 3D.
-    Higher quality than TripoSR but slower.
-
-    Requires more VRAM (~8GB+).
-    """
-
-    MODEL_ID = "TencentARC/InstantMesh"
-
-    def __init__(self, device: Optional[str] = None):
-        super().__init__()
-        self.device = device
-        self._pipeline = None
-
-    @property
-    def service_name(self) -> str:
-        return "instantmesh_local"
-
-    @property
-    def required_packages(self) -> list:
-        return ["torch", "diffusers", "transformers", "trimesh"]
-
-    def load_model(self) -> bool:
-        """Load InstantMesh pipeline."""
-        if self._pipeline is not None:
-            return True
-
-        try:
-            # InstantMesh requires custom loading
-            # This is a placeholder - actual implementation depends on the model release
-            print("[InstantMesh] Model loading not yet implemented")
-            print("[InstantMesh] Use TripoSR for now, or install InstantMesh manually")
-            return False
-
-        except Exception as e:
-            print(f"[InstantMesh] Failed to load: {e}")
-            return False
-
-    def generate(self, image_path: str, **kwargs) -> Dict[str, Any]:
-        """Generate 3D from image."""
-        if not self.load_model():
-            return {
-                "success": False,
-                "error": "InstantMesh not available. Use triposr_local instead."
-            }
-
-        # Placeholder
-        return {"success": False, "error": "Not implemented"}
-
-
 class Depth2MeshService(BaseLocalService, ModelOutputMixin):
     """
     Generate 3D mesh from depth estimation.
@@ -313,11 +260,15 @@ class Depth2MeshService(BaseLocalService, ModelOutputMixin):
         Args:
             image_path: Path to input image
             depth_scale: Scale factor for depth
-            output_format: Output format (obj, ply)
+            output_format: Output format - only 'obj' is supported (the mesh
+                           writer emits OBJ text)
 
         Returns:
             Dict with mesh path
         """
+        # The writer below produces OBJ; honoring another extension would
+        # write a mislabeled file that fails to re-import.
+        output_format = "obj"
         if not self.load_model():
             return {
                 "success": False,
@@ -391,7 +342,7 @@ def get_local_image_to_3d(
     Get a local image-to-3D service.
 
     Args:
-        provider: Service provider (triposr, instantmesh, depth2mesh)
+        provider: Service provider (triposr, depth2mesh)
         device: Device to use (cuda, mps, cpu)
 
     Returns:
@@ -399,7 +350,6 @@ def get_local_image_to_3d(
     """
     providers = {
         "triposr": LocalTripoSR,
-        "instantmesh": LocalInstantMesh,
         "depth2mesh": Depth2MeshService,
     }
 

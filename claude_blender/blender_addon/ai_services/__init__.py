@@ -28,14 +28,12 @@ from .comfyui_bridge import (
 
 from .local_text_to_3d import (
     LocalShapE,
-    LocalPointE,
     ProceduralGenerator,
     get_local_text_to_3d,
 )
 
 from .local_image_to_3d import (
     LocalTripoSR,
-    LocalInstantMesh,
     Depth2MeshService,
     get_local_image_to_3d,
 )
@@ -56,13 +54,11 @@ __all__ = [
 
     # Text-to-3D (local)
     "LocalShapE",
-    "LocalPointE",
     "ProceduralGenerator",
     "get_local_text_to_3d",
 
     # Image-to-3D (local)
     "LocalTripoSR",
-    "LocalInstantMesh",
     "Depth2MeshService",
     "get_local_image_to_3d",
 ]

@@ -7,7 +7,7 @@ No external API calls.
 
 Supported models:
     - Shap-E: OpenAI's text-to-3D model
-    - Point-E: OpenAI's point cloud to 3D
+    - Procedural: algorithmic generation, no dependencies
 
 Requirements:
     pip install torch torchvision
@@ -149,65 +149,6 @@ class LocalShapE(BaseLocalService, ModelOutputMixin):
             return {"success": False, "error": str(e)}
 
 
-class LocalPointE(BaseLocalService, ModelOutputMixin):
-    """
-    Local Point-E text-to-3D service.
-
-    Point-E generates point clouds from text, then converts to mesh.
-    Faster than Shap-E but lower quality.
-
-    Model: openai/point-e (Hugging Face)
-    """
-
-    def __init__(self, device: Optional[str] = None):
-        super().__init__()
-        self.device = device
-        self._pipe = None
-
-    @property
-    def service_name(self) -> str:
-        return "point_e"
-
-    @property
-    def required_packages(self) -> list:
-        return ["torch", "diffusers", "transformers"]
-
-    def _get_device(self) -> str:
-        if self.device:
-            return self.device
-        try:
-            import torch
-            if torch.cuda.is_available():
-                return "cuda"
-            elif torch.backends.mps.is_available():
-                return "mps"
-            return "cpu"
-        except:
-            return "cpu"
-
-    def load_model(self) -> bool:
-        """Load Point-E pipeline."""
-        if self._pipe is not None:
-            return True
-
-        try:
-            # Point-E requires special setup
-            print("[Point-E] Loading model...")
-            # Placeholder - Point-E has a different architecture
-            return False
-
-        except Exception as e:
-            print(f"[Point-E] Failed to load: {e}")
-            return False
-
-    def generate(self, prompt: str, **kwargs) -> Dict[str, Any]:
-        """Generate 3D from text."""
-        return {
-            "success": False,
-            "error": "Point-E not fully implemented. Use shap_e instead."
-        }
-
-
 class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
     """
     Procedural 3D generation without AI models.
@@ -242,6 +183,8 @@ class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
     def generate(
         self,
         object_type: str,
+        size: float = 1.0,
+        seed: Optional[int] = None,
         **params
     ) -> Dict[str, Any]:
         """
@@ -250,67 +193,81 @@ class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
         Args:
             object_type: Type of procedural generation
                 - "rock": Procedural rock/boulder
-                - "tree": L-system tree
+                - "tree": Simple stylized tree
                 - "terrain": Noise-based terrain
                 - "building": Simple procedural building
+            size: Overall size; mapped onto each generator's own dimensions
+            seed: Random seed - same seed, same result
 
         Returns:
             Dict with result info (generates directly in Blender)
         """
-        generators = {
-            "rock": self._generate_rock,
-            "tree": self._generate_tree,
-            "terrain": self._generate_terrain,
-            "building": self._generate_building,
+        import random
+
+        rng = random.Random(seed)
+
+        # Each generator has its own dimension vocabulary; route the shared
+        # size/seed contract onto it rather than passing kwargs blindly.
+        object_type = object_type.lower()
+        if object_type == "rock":
+            return self._generate_rock(size=size, rng=rng, **params)
+        if object_type == "terrain":
+            return self._generate_terrain(size=size * 10.0, rng=rng, **params)
+        if object_type == "tree":
+            return self._generate_tree(height=size * 3.0, rng=rng, **params)
+        if object_type == "building":
+            return self._generate_building(
+                width=size * 2.0, depth=size * 2.0, height=size * 4.0,
+                rng=rng, **params
+            )
+        return {
+            "success": False,
+            "error": f"Unknown type: {object_type}. "
+                     "Available: ['rock', 'tree', 'terrain', 'building']"
         }
 
-        generator = generators.get(object_type.lower())
-        if not generator:
-            return {
-                "success": False,
-                "error": f"Unknown type: {object_type}. Available: {list(generators.keys())}"
-            }
+    @staticmethod
+    def _apply_modifier(obj, modifier_name: str):
+        """modifier_apply needs an explicit context when run from a timer."""
+        import bpy
 
-        return generator(**params)
+        with bpy.context.temp_override(
+            object=obj, active_object=obj, selected_objects=[obj]
+        ):
+            bpy.ops.object.modifier_apply(modifier=modifier_name)
 
     def _generate_rock(
         self,
         size: float = 1.0,
         detail: int = 3,
-        seed: Optional[int] = None
+        rng=None,
     ) -> Dict[str, Any]:
         """Generate a procedural rock."""
         import bpy
+        import math
         import random
 
-        if seed is not None:
-            random.seed(seed)
+        rng = rng or random.Random()
 
-        # Create icosphere
-        bpy.ops.mesh.primitive_ico_sphere_add(
-            subdivisions=detail,
-            radius=size
-        )
+        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=detail, radius=size)
         obj = bpy.context.active_object
         obj.name = f"Rock_{int(time.time())}"
 
-        # Add displacement modifier
-        bpy.ops.object.modifier_add(type='DISPLACE')
-        displace = obj.modifiers["Displace"]
-
-        # Create noise texture
+        # Seeded variation: noise character, displacement depth, orientation
+        displace = obj.modifiers.new("Displace", 'DISPLACE')
         tex = bpy.data.textures.new(f"RockNoise_{obj.name}", 'CLOUDS')
-        tex.noise_scale = 0.5
+        tex.noise_scale = rng.uniform(0.35, 0.75)
+        tex.noise_depth = rng.randint(1, 4)
         displace.texture = tex
-        displace.strength = size * 0.3
+        displace.strength = size * rng.uniform(0.22, 0.42)
+        self._apply_modifier(obj, displace.name)
 
-        # Apply modifier
-        bpy.ops.object.modifier_apply(modifier="Displace")
+        subsurf = obj.modifiers.new("Subdivision", 'SUBSURF')
+        subsurf.levels = 1
+        self._apply_modifier(obj, subsurf.name)
 
-        # Add subdivision for smoothing
-        bpy.ops.object.modifier_add(type='SUBSURF')
-        obj.modifiers["Subdivision"].levels = 1
-        bpy.ops.object.modifier_apply(modifier="Subdivision")
+        obj.rotation_euler = (0, 0, rng.uniform(0, math.tau))
+        obj.scale = (1.0, rng.uniform(0.75, 1.0), rng.uniform(0.55, 0.9))
 
         return {
             "success": True,
@@ -321,20 +278,16 @@ class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
     def _generate_tree(
         self,
         height: float = 3.0,
-        branches: int = 5,
-        seed: Optional[int] = None
+        rng=None,
     ) -> Dict[str, Any]:
-        """Generate a simple procedural tree."""
+        """Generate a simple stylized tree."""
         import bpy
-        import math
         import random
 
-        if seed is not None:
-            random.seed(seed)
+        rng = rng or random.Random()
 
-        # Create trunk
         bpy.ops.mesh.primitive_cylinder_add(
-            radius=height * 0.05,
+            radius=height * rng.uniform(0.04, 0.07),
             depth=height * 0.6,
             location=(0, 0, height * 0.3)
         )
@@ -345,7 +298,7 @@ class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
         foliage_objs = []
         for i in range(3):
             h = height * (0.5 + i * 0.2)
-            r = height * (0.4 - i * 0.1)
+            r = height * (0.4 - i * 0.1) * rng.uniform(0.85, 1.15)
             bpy.ops.mesh.primitive_cone_add(
                 radius1=r,
                 depth=height * 0.3,
@@ -355,9 +308,11 @@ class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
             foliage.name = f"Tree_Foliage_{i}"
             foliage_objs.append(foliage)
 
-        # Parent foliage to trunk
+        # Parent foliage to trunk, keeping world positions - a bare
+        # .parent assignment would re-offset children by the trunk's location
         for f in foliage_objs:
             f.parent = trunk
+            f.matrix_parent_inverse = trunk.matrix_world.inverted_safe()
 
         return {
             "success": True,
@@ -370,16 +325,14 @@ class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
         size: float = 10.0,
         resolution: int = 50,
         height_scale: float = 2.0,
-        seed: Optional[int] = None
+        rng=None,
     ) -> Dict[str, Any]:
         """Generate noise-based terrain."""
         import bpy
         import random
 
-        if seed is not None:
-            random.seed(seed)
+        rng = rng or random.Random()
 
-        # Create grid
         bpy.ops.mesh.primitive_grid_add(
             x_subdivisions=resolution,
             y_subdivisions=resolution,
@@ -388,18 +341,14 @@ class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
         terrain = bpy.context.active_object
         terrain.name = f"Terrain_{int(time.time())}"
 
-        # Add displacement
-        bpy.ops.object.modifier_add(type='DISPLACE')
-        displace = terrain.modifiers["Displace"]
-
+        displace = terrain.modifiers.new("Displace", 'DISPLACE')
         tex = bpy.data.textures.new(f"TerrainNoise_{terrain.name}", 'CLOUDS')
-        tex.noise_scale = 1.0
-        tex.noise_depth = 4
+        tex.noise_scale = rng.uniform(0.7, 1.6)
+        tex.noise_depth = rng.randint(3, 6)
         displace.texture = tex
-        displace.strength = height_scale
+        displace.strength = height_scale * rng.uniform(0.8, 1.25)
         displace.mid_level = 0.5
-
-        bpy.ops.object.modifier_apply(modifier="Displace")
+        self._apply_modifier(terrain, displace.name)
 
         return {
             "success": True,
@@ -412,25 +361,21 @@ class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
         width: float = 2.0,
         depth: float = 2.0,
         height: float = 4.0,
-        floors: int = 2,
-        seed: Optional[int] = None
+        rng=None,
     ) -> Dict[str, Any]:
         """Generate a simple procedural building."""
         import bpy
         import random
 
-        if seed is not None:
-            random.seed(seed)
+        rng = rng or random.Random()
+        height = height * rng.uniform(0.85, 1.3)
 
-        # Main structure
-        bpy.ops.mesh.primitive_cube_add(
-            size=1,
-            location=(0, 0, height / 2)
-        )
+        # Main structure; the scale stays on the object (transform_apply
+        # would need operator context and buys nothing for a static prop)
+        bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, height / 2))
         building = bpy.context.active_object
         building.name = f"Building_{int(time.time())}"
         building.scale = (width / 2, depth / 2, height / 2)
-        bpy.ops.object.transform_apply(scale=True)
 
         # Add roof
         bpy.ops.mesh.primitive_cone_add(
@@ -439,8 +384,9 @@ class ProceduralGenerator(BaseLocalService, ModelOutputMixin):
             location=(0, 0, height + height * 0.15)
         )
         roof = bpy.context.active_object
-        roof.name = f"Building_Roof"
+        roof.name = "Building_Roof"
         roof.parent = building
+        roof.matrix_parent_inverse = building.matrix_world.inverted_safe()
 
         return {
             "success": True,
@@ -458,7 +404,7 @@ def get_local_text_to_3d(
     Get a local text-to-3D service.
 
     Args:
-        provider: Service provider (shap_e, point_e, procedural)
+        provider: Service provider (shap_e, procedural)
         device: Device to use (cuda, mps, cpu)
 
     Returns:
@@ -467,7 +413,6 @@ def get_local_text_to_3d(
     providers = {
         "shap_e": lambda: LocalShapE(device=device),
         "shape": lambda: LocalShapE(device=device),  # Alias
-        "point_e": lambda: LocalPointE(device=device),
         "procedural": lambda: ProceduralGenerator(),
     }
 

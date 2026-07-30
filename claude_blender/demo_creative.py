@@ -20,10 +20,13 @@ class BlenderDemo:
     def call(self, method, **params):
         self._id += 1
         request = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params}
-        self.socket.send(json.dumps(request).encode() + b'\n')
+        self.socket.sendall(json.dumps(request).encode() + b'\n')
         response = b''
         while b'\n' not in response:
-            response += self.socket.recv(65536)
+            chunk = self.socket.recv(65536)
+            if not chunk:
+                raise ConnectionError("Blender closed the connection mid-response")
+            response += chunk
         return json.loads(response.decode())
 
     def execute(self, code):
@@ -31,6 +34,19 @@ class BlenderDemo:
 
     def close(self):
         self.socket.close()
+
+
+def report(response):
+    """Print the real outcome of an execute call. Returns True on success."""
+    if "error" in response:
+        print(f"FAILED: {response['error'].get('message', response['error'])}")
+        return False
+    payload = response.get("result") or {}
+    if not payload.get("success"):
+        print(f"FAILED: {payload.get('error', 'unknown error')}")
+        return False
+    print(f"Result: {payload.get('result')}")
+    return True
 
 
 def demo_geometric_sculpture(client):
@@ -188,8 +204,7 @@ __result__ = f"Created geometric sculpture with {num_objects} gems!"
 '''
 
     result = client.execute(code)
-    print(f"Result: {result.get('result', {}).get('result', 'Done')}")
-    return result
+    return report(result)
 
 
 def demo_solar_system(client):
@@ -275,6 +290,7 @@ for name, radius, orbit_radius, color, speed, has_rings in planets:
         rings.name = f"{name}_Rings"
         rings.scale = (1, 1, 0.05)
         rings.parent = planet
+        rings.matrix_parent_inverse = planet.matrix_world.inverted_safe()
         link_to_collection(rings)
 
         ring_mat = bpy.data.materials.new(f"{name}_Ring_Material")
@@ -282,7 +298,7 @@ for name, radius, orbit_radius, color, speed, has_rings in planets:
         ring_bsdf = ring_mat.node_tree.nodes.get("Principled BSDF")
         ring_bsdf.inputs["Base Color"].default_value = (0.8, 0.7, 0.6, 1)
         ring_bsdf.inputs["Alpha"].default_value = 0.7
-        ring_mat.blend_method = 'BLEND'
+        ring_mat.surface_render_method = 'BLENDED'
         rings.data.materials.append(ring_mat)
 
     # Animate orbiting planets
@@ -366,8 +382,7 @@ __result__ = f"Created solar system with {len(created_objects)} celestial bodies
 '''
 
     result = client.execute(code)
-    print(f"Result: {result.get('result', {}).get('result', 'Done')}")
-    return result
+    return report(result)
 
 
 def demo_procedural_landscape(client):
@@ -496,6 +511,7 @@ def create_tree(location, scale=1.0):
         link_to_collection(cone)
         cone.data.materials.append(foliage_mat)
         cone.parent = trunk
+        cone.matrix_parent_inverse = trunk.matrix_world.inverted_safe()
 
     return trunk
 
@@ -529,7 +545,7 @@ water_bsdf.inputs["Metallic"].default_value = 0.0
 water_bsdf.inputs["Roughness"].default_value = 0.1
 water_bsdf.inputs["IOR"].default_value = 1.33
 water_bsdf.inputs["Alpha"].default_value = 0.8
-water_mat.blend_method = 'BLEND'
+water_mat.surface_render_method = 'BLENDED'
 water.data.materials.append(water_mat)
 
 # Add sky/sun
@@ -562,40 +578,7 @@ __result__ = f"Created procedural landscape with {tree_count} trees!"
 '''
 
     result = client.execute(code)
-    print(f"Result: {result.get('result', {}).get('result', 'Done')}")
-    return result
-
-
-def render_demo(client, name, filepath):
-    """Render the current scene."""
-    print(f"\nRendering {name}...")
-
-    code = f'''
-import bpy
-
-# Configure render settings
-bpy.context.scene.render.engine = 'CYCLES'
-bpy.context.scene.cycles.samples = 64
-bpy.context.scene.cycles.use_denoising = True
-bpy.context.scene.render.resolution_x = 1920
-bpy.context.scene.render.resolution_y = 1080
-bpy.context.scene.render.filepath = "{filepath}"
-
-# Use GPU if available
-prefs = bpy.context.preferences.addons.get('cycles')
-if prefs:
-    prefs.preferences.compute_device_type = 'METAL'  # macOS
-    bpy.context.scene.cycles.device = 'GPU'
-
-# Render
-bpy.ops.render.render(write_still=True)
-
-__result__ = "Render complete: {filepath}"
-'''
-
-    result = client.execute(code)
-    print(f"Result: {result.get('result', {}).get('result', 'Done')}")
-    return result
+    return report(result)
 
 
 if __name__ == "__main__":

@@ -54,8 +54,8 @@ class BlenderClient:
             "params": params if params else {}
         }
 
-        # Send request
-        self.socket.send(json.dumps(request).encode() + b'\n')
+        # Send request (sendall: send() may write only part of the payload)
+        self.socket.sendall(json.dumps(request).encode() + b'\n')
 
         # Receive response
         response_data = b''

@@ -106,9 +106,11 @@ class ModelOutputMixin:
             elif ext == "fbx":
                 bpy.ops.import_scene.fbx(filepath=filepath)
             elif ext == "stl":
-                bpy.ops.import_mesh.stl(filepath=filepath)
+                # Blender 4.1 removed the legacy import_mesh.stl operator
+                bpy.ops.wm.stl_import(filepath=filepath)
             elif ext == "ply":
-                bpy.ops.import_mesh.ply(filepath=filepath)
+                # Blender 4.0 removed the legacy import_mesh.ply operator
+                bpy.ops.wm.ply_import(filepath=filepath)
             else:
                 return {"success": False, "error": f"Unsupported format: {ext}"}
 
@@ -162,7 +164,8 @@ class TextureOutputMixin:
         mat = bpy.data.materials.get(mat_name)
         if not mat:
             mat = bpy.data.materials.new(mat_name)
-            mat.use_nodes = True
+        # A pre-existing material may not use nodes; node_tree would be None
+        mat.use_nodes = True
 
         if not obj.data.materials:
             obj.data.materials.append(mat)
@@ -170,12 +173,20 @@ class TextureOutputMixin:
             obj.data.materials[0] = mat
 
         # Load texture
-        img = bpy.data.images.load(texture_path)
+        try:
+            img = bpy.data.images.load(texture_path)
+        except RuntimeError as e:
+            return {"success": False, "error": f"Cannot load texture: {e}"}
 
         # Add texture node
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
         bsdf = nodes.get("Principled BSDF")
+        if bsdf is None:
+            bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if bsdf is None:
+            return {"success": False,
+                    "error": f"Material {mat_name} has no Principled BSDF node"}
 
         tex_node = nodes.new("ShaderNodeTexImage")
         tex_node.image = img
