@@ -9,18 +9,17 @@ with integrations for text-to-3D, image-to-3D, AI textures, and more.
 bl_info = {
     "name": "Claude Blender",
     "author": "Claude Code",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Claude",
     "description": "AI-powered Blender control via Claude Code",
-    "warning": "Development version",
-    "doc_url": "",
+    "doc_url": "https://github.com/minihellboy/claude-blender",
     "category": "Development",
 }
 
 import bpy
-from bpy.props import IntProperty, BoolProperty, StringProperty, EnumProperty
-from bpy.types import Operator, Panel, PropertyGroup, AddonPreferences
+from bpy.props import IntProperty, BoolProperty
+from bpy.types import Operator, Panel, AddonPreferences
 
 # Import core modules
 from .core.server import BlenderServer, get_server
@@ -71,6 +70,9 @@ def _setup_handler():
         'render': lambda **kwargs: _scene_utils.render_image(**kwargs),
         'render_animation': lambda **kwargs: _scene_utils.render_animation(**kwargs),
 
+        # File
+        'save_file': lambda **kwargs: _scene_utils.save_file(**kwargs),
+
         # Import / export
         'import_model': lambda **kwargs: io_utils.import_model(**kwargs),
         'export_model': lambda **kwargs: io_utils.export_model(**kwargs),
@@ -103,6 +105,16 @@ def _setup_handler():
 # Addon Preferences
 # ============================================================================
 
+def _auto_start_updated(self, context):
+    """Apply the auto-start toggle immediately instead of on next restart."""
+    if self.auto_start:
+        server = get_server()
+        if not server.is_running:
+            _setup_handler()
+            server.port = self.port
+            server.start()
+
+
 class ClaudeBlenderPreferences(AddonPreferences):
     bl_idname = __name__
 
@@ -117,26 +129,8 @@ class ClaudeBlenderPreferences(AddonPreferences):
     auto_start: BoolProperty(
         name="Auto-start Server",
         description="Automatically start the server when Blender opens",
-        default=False,
-    )
-
-    # API Keys (stored securely in Blender preferences)
-    replicate_api_key: StringProperty(
-        name="Replicate API Key",
-        description="API key for Replicate.com (for AI models)",
-        subtype='PASSWORD',
-    )
-
-    tripo_api_key: StringProperty(
-        name="Tripo AI API Key",
-        description="API key for Tripo3D.ai (text-to-3D)",
-        subtype='PASSWORD',
-    )
-
-    meshy_api_key: StringProperty(
-        name="Meshy API Key",
-        description="API key for Meshy.ai (text-to-3D)",
-        subtype='PASSWORD',
+        default=True,
+        update=_auto_start_updated,
     )
 
     def draw(self, context):
@@ -147,36 +141,6 @@ class ClaudeBlenderPreferences(AddonPreferences):
         box.label(text="Server Settings", icon='NETWORK_DRIVE')
         box.prop(self, "port")
         box.prop(self, "auto_start")
-
-        # API Keys
-        box = layout.box()
-        box.label(text="API Keys", icon='KEY_HLT')
-        box.prop(self, "replicate_api_key")
-        box.prop(self, "tripo_api_key")
-        box.prop(self, "meshy_api_key")
-
-
-# ============================================================================
-# Scene Properties
-# ============================================================================
-
-class ClaudeBlenderProperties(PropertyGroup):
-    """Runtime properties for the addon."""
-
-    is_running: BoolProperty(
-        name="Server Running",
-        default=False,
-    )
-
-    last_command: StringProperty(
-        name="Last Command",
-        default="",
-    )
-
-    command_count: IntProperty(
-        name="Command Count",
-        default=0,
-    )
 
 
 # ============================================================================
@@ -191,26 +155,27 @@ class CLAUDE_OT_start_server(Operator):
 
     def execute(self, context):
         prefs = context.preferences.addons[__name__].preferences
-        props = context.scene.claude_blender
+        server = get_server()
 
-        if props.is_running:
+        # The server is process-global and survives file loads; ask IT.
+        if server.is_running:
             self.report({'WARNING'}, "Server is already running")
             return {'CANCELLED'}
 
         # Ensure handler is set up
         _setup_handler()
-
-        # Start server
-        server = get_server()
         server.port = prefs.port
 
         if server.start():
-            props.is_running = True
             self.report({'INFO'}, f"Server started on port {prefs.port}")
             return {'FINISHED'}
-        else:
-            self.report({'ERROR'}, "Failed to start server")
-            return {'CANCELLED'}
+
+        reason = server.last_error or "unknown error"
+        if "address already in use" in reason.lower():
+            reason += f" - another process is using port {prefs.port}; " \
+                      "change it in the addon preferences"
+        self.report({'ERROR'}, f"Failed to start server on port {prefs.port}: {reason}")
+        return {'CANCELLED'}
 
 
 class CLAUDE_OT_stop_server(Operator):
@@ -220,16 +185,13 @@ class CLAUDE_OT_stop_server(Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        props = context.scene.claude_blender
+        server = get_server()
 
-        if not props.is_running:
+        if not server.is_running:
             self.report({'WARNING'}, "Server is not running")
             return {'CANCELLED'}
 
-        server = get_server()
         server.stop()
-        props.is_running = False
-
         self.report({'INFO'}, "Server stopped")
         return {'FINISHED'}
 
@@ -281,13 +243,16 @@ class CLAUDE_PT_main_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.claude_blender
         prefs = context.preferences.addons[__name__].preferences
 
-        # Status
+        # Status comes from the process-global server, never from scene
+        # state - the server survives File > New / Open, scene props don't.
+        server = get_server()
+        running = server.is_running
+
         box = layout.box()
         row = box.row()
-        if props.is_running:
+        if running:
             row.label(text="Status: Running", icon='CHECKMARK')
         else:
             row.label(text="Status: Stopped", icon='X')
@@ -295,15 +260,17 @@ class CLAUDE_PT_main_panel(Panel):
         row = box.row()
         row.label(text=f"Port: {prefs.port}")
 
-        server = get_server()
-        if props.is_running:
+        if running:
             row = box.row()
             row.label(text=f"Clients: {server.client_count}")
+        else:
+            row = box.row()
+            row.label(text="Claude Code needs this running", icon='INFO')
 
         # Controls
         layout.separator()
 
-        if props.is_running:
+        if running:
             layout.operator("claude.stop_server", icon='PAUSE')
         else:
             layout.operator("claude.start_server", icon='PLAY')
@@ -343,38 +310,17 @@ class CLAUDE_PT_connection_panel(Panel):
         col.label(text='  "method":"ping","id":1}\\n\')')
 
 
-class CLAUDE_PT_api_keys_panel(Panel):
-    """API Keys panel"""
-    bl_label = "API Keys"
-    bl_idname = "CLAUDE_PT_api_keys_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Claude'
-    bl_parent_id = "CLAUDE_PT_main_panel"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        prefs = context.preferences.addons[__name__].preferences
-
-        layout.prop(prefs, "replicate_api_key")
-        layout.prop(prefs, "tripo_api_key")
-        layout.prop(prefs, "meshy_api_key")
-
-
 # ============================================================================
 # Registration
 # ============================================================================
 
 classes = [
     ClaudeBlenderPreferences,
-    ClaudeBlenderProperties,
     CLAUDE_OT_start_server,
     CLAUDE_OT_stop_server,
     CLAUDE_OT_test_connection,
     CLAUDE_PT_main_panel,
     CLAUDE_PT_connection_panel,
-    CLAUDE_PT_api_keys_panel,
 ]
 
 
@@ -382,12 +328,11 @@ def _auto_start():
     """Delayed auto-start to ensure Blender is fully loaded."""
     try:
         prefs = bpy.context.preferences.addons[__name__].preferences
-        if prefs.auto_start:
+        if prefs.auto_start and not get_server().is_running:
             _setup_handler()
             server = get_server()
             server.port = prefs.port
             if server.start():
-                bpy.context.scene.claude_blender.is_running = True
                 print(f"[Claude Blender] Auto-started on port {prefs.port}")
     except Exception as e:
         print(f"[Claude Blender] Auto-start failed: {e}")
@@ -397,8 +342,6 @@ def _auto_start():
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-
-    bpy.types.Scene.claude_blender = bpy.props.PointerProperty(type=ClaudeBlenderProperties)
 
     # Schedule auto-start check
     prefs = bpy.context.preferences.addons.get(__name__)
@@ -415,8 +358,6 @@ def unregister():
         server.stop()
     except:
         pass
-
-    del bpy.types.Scene.claude_blender
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

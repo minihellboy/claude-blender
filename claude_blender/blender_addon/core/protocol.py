@@ -26,6 +26,10 @@ INTERNAL_ERROR = -32603
 SERVER_ERROR = -32000
 
 
+# Distinguishes "no id key" (a notification) from an explicit "id": null.
+_MISSING = object()
+
+
 class JSONRPCHandler:
     """
     JSON-RPC 2.0 request handler.
@@ -33,7 +37,7 @@ class JSONRPCHandler:
     Supports:
     - Single requests
     - Batch requests (array of requests)
-    - Notifications (requests without id)
+    - Notifications (requests without id) - never answered, even on error
     """
 
     def __init__(self):
@@ -95,15 +99,20 @@ class JSONRPCHandler:
 
         method = data.get('method')
         params = data.get('params', {})
-        request_id = data.get('id')
+        request_id = data.get('id', _MISSING)
+        is_notification = request_id is _MISSING
+        if is_notification:
+            request_id = None
 
         # Method must be a string
         if not isinstance(method, str):
-            return self._error_dict(request_id, INVALID_REQUEST, "Method must be a string")
+            return None if is_notification else \
+                self._error_dict(request_id, INVALID_REQUEST, "Method must be a string")
 
         # Check if method exists
         if method not in self.methods:
-            return self._error_dict(request_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+            return None if is_notification else \
+                self._error_dict(request_id, METHOD_NOT_FOUND, f"Method not found: {method}")
 
         # Execute method
         try:
@@ -117,18 +126,19 @@ class JSONRPCHandler:
             else:
                 result = handler()
 
-            # If this is a notification (no id), don't return a response
-            if request_id is None:
+            if is_notification:
                 return None
-
             return self._success_dict(request_id, result)
 
         except JSONRPCError as e:
-            return self._error_dict(request_id, e.code, e.message, e.data)
+            return None if is_notification else \
+                self._error_dict(request_id, e.code, e.message, e.data)
         except TypeError as e:
-            return self._error_dict(request_id, INVALID_PARAMS, f"Invalid params: {e}")
+            return None if is_notification else \
+                self._error_dict(request_id, INVALID_PARAMS, f"Invalid params: {e}")
         except Exception as e:
-            return self._error_dict(request_id, SERVER_ERROR, str(e))
+            return None if is_notification else \
+                self._error_dict(request_id, SERVER_ERROR, str(e))
 
     def _success_dict(self, request_id: Any, result: Any) -> Dict:
         """Create a success response dict."""

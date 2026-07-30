@@ -80,7 +80,12 @@ class BlenderClient:
         """
         async with self._lock:
             if not await self.ensure_connected():
-                return {"error": {"code": -32000, "message": "Not connected to Blender"}}
+                return {"error": {"code": -32000, "message": (
+                    f"Cannot reach Blender at {self.host}:{self.port}. "
+                    "In Blender: press N in the 3D viewport, open the 'Claude' "
+                    "tab, and click 'Start Server' (or enable auto-start in "
+                    "the addon preferences)."
+                )}}
 
             self._id += 1
             request = {
@@ -188,5 +193,9 @@ def get_client(host: str = '127.0.0.1', port: int = 9876) -> BlenderClient:
     """Get or create the global client instance for the given endpoint."""
     global _client
     if _client is None or _client.host != host or _client.port != port:
+        if _client is not None and _client._writer is not None:
+            # Close the superseded connection's transport; the async
+            # wait_closed handshake isn't available from this sync path.
+            _client._writer.close()
         _client = BlenderClient(host, port)
     return _client

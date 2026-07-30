@@ -113,7 +113,12 @@ def frame_camera(
     ))
 
     if cam.data.type == 'ORTHO':
-        cam.data.ortho_scale = 2.0 * radius * margin
+        # ortho_scale spans the LONGER render axis (sensor fit AUTO); scale
+        # up by the aspect ratio so the subject also fits the shorter axis.
+        res = bpy.context.scene.render
+        long_side = max(res.resolution_x, res.resolution_y)
+        short_side = max(min(res.resolution_x, res.resolution_y), 1)
+        cam.data.ortho_scale = 2.0 * radius * margin * (long_side / short_side)
         dist = distance if distance is not None else radius * 3.0
     else:
         # sin() (not tan()) so the bounding sphere is tangent to the frustum.
@@ -123,10 +128,11 @@ def frame_camera(
     cam.location = center + direction * dist
     cam.rotation_euler = (center - cam.location).to_track_quat('-Z', 'Y').to_euler()
 
-    # Keep the subject inside the clip range.
-    if dist + radius > cam.data.clip_end:
-        cam.data.clip_end = (dist + radius) * 4
-    cam.data.clip_start = min(cam.data.clip_start, max(dist - radius, 0.01) / 10)
+    # Keep the subject inside the clip range. Both planes are set absolutely
+    # from this fit - min()/max() against old values would ratchet across
+    # repeated framing calls and destroy depth precision.
+    cam.data.clip_end = max((dist + radius) * 4, 100.0)
+    cam.data.clip_start = min(max((dist - radius) * 0.1, 0.001), 0.1)
 
     bpy.context.scene.camera = cam
 

@@ -11,7 +11,7 @@ from claude_blender_mcp import blender_client
 from claude_blender_mcp import server as srv
 
 
-EXPECTED_TOOL_COUNT = 27
+EXPECTED_TOOL_COUNT = 28
 
 
 def _image_contents(result):
@@ -70,6 +70,9 @@ async def test_get_object_structured(client):
     r = await client.call_tool("blender_get_object", {"name": "Cube"})
     sc = r.structured_content
     assert sc["dimensions"] == [2.0, 2.0, 2.0]
+    # Regression: the addon sends 'rotation_euler'; a plain 'rotation' read
+    # silently reported [0,0,0] for every rotated object.
+    assert sc["rotation"] == [0.0, 0.0, 0.7854]
     assert sc["modifiers"] == [{"name": "Subsurf", "type": "SUBSURF"}]
     assert sc["vertex_count"] == 8
     assert sc["polygon_count"] == 6

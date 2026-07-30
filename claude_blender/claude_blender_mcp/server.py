@@ -54,6 +54,8 @@ mcp = MCPServer(
         "deserves full resolution and high samples.\n"
         "\n"
         "Tips:\n"
+        "- blender_save persists the .blend file; nothing else does. Save "
+        "after substantial scene work.\n"
         "- blender_frame_camera aims the camera at any object(s) with correct "
         "fit math; use it instead of hand-computing camera transforms.\n"
         "- blender_render_animation returns preview stills from the video so "
@@ -61,7 +63,7 @@ mcp = MCPServer(
         "- If a tool reports a connection problem, call blender_ping and tell "
         "the user to start the server from Blender's Claude sidebar tab."
     ),
-    version="0.3.0",
+    version="0.4.0",
     cache_hints={
         "tools/list": _LIST_CACHE,
         "prompts/list": _LIST_CACHE,
@@ -106,6 +108,23 @@ def _require_success(result: dict, action: str) -> None:
     """Raise ToolError if a Blender-side operation reported failure."""
     if not result.get("success"):
         raise ToolError(f"{action} failed: {result.get('error', 'Unknown error')}")
+
+
+def _ai_payload(result: dict, action: str) -> dict:
+    """Return the __result__ dict from an ai_* execute call, or raise.
+
+    Guards the silent-failure path: when the generated code itself crashes,
+    execute reports success=False with result=None - that must surface as a
+    ToolError, never as a success-shaped string.
+    """
+    if result.get("error"):
+        raise ToolError(f"{action} failed: {result['error']}")
+    payload = result.get("result")
+    if not isinstance(payload, dict):
+        raise ToolError(f"{action} returned an unexpected result: {payload!r}")
+    if not payload.get("success"):
+        raise ToolError(f"{action} failed: {payload.get('error', 'Unknown error')}")
+    return payload
 
 
 def _preview(message: str, path: str) -> list:
@@ -264,7 +283,12 @@ async def blender_get_object(name: str) -> ObjectInfo:
         "name": result.get("name", name),
         "type": result.get("type", "UNKNOWN"),
         "location": [float(v) for v in result.get("location", [0, 0, 0])],
-        "rotation": [float(v) for v in result.get("rotation", [0, 0, 0])],
+        # The addon emits 'rotation_euler' here (object detail) but plain
+        # 'rotation' in scene listings; accept either.
+        "rotation": [
+            float(v)
+            for v in result.get("rotation_euler") or result.get("rotation") or [0, 0, 0]
+        ],
         "scale": [float(v) for v in result.get("scale", [1, 1, 1])],
         "visible": bool(result.get("visible", True)),
         "dimensions": [float(v) for v in result.get("dimensions", [0, 0, 0])],
@@ -293,6 +317,9 @@ async def blender_add_object(
     location: Optional[list] = None,
     rotation: Optional[list] = None,
     scale: Optional[list] = None,
+    energy: Optional[float] = None,
+    color: Optional[list] = None,
+    size: Optional[float] = None,
 ) -> str:
     """
     Add a primitive object to the scene.
@@ -305,6 +332,9 @@ async def blender_add_object(
         location: Position as [x, y, z] (default: [0, 0, 0])
         rotation: Rotation in radians as [x, y, z] (default: [0, 0, 0])
         scale: Scale as [x, y, z] (default: [1, 1, 1])
+        energy: Light power in watts, lights only (e.g. 800 for a key light)
+        color: Light color as [r, g, b] 0-1, lights only
+        size: Light size in meters (bigger = softer shadows), lights only
 
     Returns:
         Result message with created object name
@@ -320,6 +350,12 @@ async def blender_add_object(
         kwargs["rotation"] = rotation
     if scale:
         kwargs["scale"] = scale
+    if energy is not None:
+        kwargs["energy"] = float(energy)
+    if color is not None:
+        kwargs["color"] = [float(c) for c in color[:3]]
+    if size is not None:
+        kwargs["size"] = float(size)
 
     result = _unwrap(await client.call("add_object", **kwargs))
     _require_success(result, "Object creation")
@@ -334,9 +370,10 @@ async def blender_modify_object(
     rotation: Optional[list] = None,
     scale: Optional[list] = None,
     visible: Optional[bool] = None,
+    shade_smooth: Optional[bool] = None,
 ) -> str:
     """
-    Modify an existing object's transform or visibility.
+    Modify an existing object's transform, visibility, or shading.
 
     Args:
         name: Name of the object to modify
@@ -344,6 +381,8 @@ async def blender_modify_object(
         rotation: New rotation in radians as [x, y, z]
         scale: New scale as [x, y, z]
         visible: Set visibility (True/False)
+        shade_smooth: Smooth (True) or flat (False) shading - meshes only,
+                      the usual companion to a SUBSURF modifier
 
     Returns:
         Result message
@@ -359,6 +398,8 @@ async def blender_modify_object(
         kwargs["scale"] = scale
     if visible is not None:
         kwargs["visible"] = visible
+    if shade_smooth is not None:
+        kwargs["shade_smooth"] = shade_smooth
 
     result = _unwrap(await client.modify_object(**kwargs))
     _require_success(result, "Object modification")
@@ -476,19 +517,23 @@ async def blender_screenshot(
 @mcp.tool(annotations=_CAPTURE, structured_output=False)
 async def blender_render(
     filepath: Optional[str] = None,
-    engine: str = "CYCLES",
-    samples: int = 128,
-    resolution_x: int = 1920,
-    resolution_y: int = 1080,
+    engine: str = "BLENDER_EEVEE_NEXT",
+    samples: int = 32,
+    resolution_x: int = 960,
+    resolution_y: int = 540,
 ):
     """
     Render the current scene and return the image.
 
-    Renders block until finished; high sample counts can take several minutes.
+    The defaults are a FAST DRAFT (EEVEE, 960x540, 32 samples) for the
+    iterate-cheap loop. For a final image pass engine='CYCLES',
+    samples=128+, and full resolution - and expect it to take minutes.
+    Render settings are per-call; the user's scene configuration is restored
+    afterwards.
 
     Args:
         filepath: Where to save the render (default: temp file)
-        engine: Render engine - 'CYCLES', 'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'
+        engine: Render engine - 'BLENDER_EEVEE_NEXT' (fast) or 'CYCLES' (quality)
         samples: Number of render samples (higher = better quality, slower)
         resolution_x: Output width in pixels
         resolution_y: Output height in pixels
@@ -595,6 +640,14 @@ async def blender_render_animation(
             span = end - start
             frames = sorted({start + round(span * i / (n_previews - 1)) for i in range(n_previews)})
 
+        # Preview stills move the playhead; remember where the user had it.
+        orig_frame = None
+        try:
+            r = await client.execute("import bpy\n__result__ = bpy.context.scene.frame_current")
+            orig_frame = int(_unwrap(r).get("result"))
+        except Exception:
+            pass
+
         for frame in frames:
             try:
                 if result.get("container") == "PNG":
@@ -622,10 +675,45 @@ async def blender_render_animation(
             except Exception:
                 continue  # Previews are best-effort; the video itself succeeded.
 
+        if orig_frame is not None:
+            try:
+                await client.execute(
+                    f"import bpy\nbpy.context.scene.frame_set({orig_frame})"
+                )
+            except Exception:
+                pass
+
         if len(content) == 1:
             content[0] += "\n(preview stills could not be generated)"
 
     return content
+
+
+@mcp.tool(annotations=_CAPTURE)
+async def blender_save(filepath: Optional[str] = None, copy: bool = False) -> str:
+    """
+    Save the current .blend file. Do this after substantial scene work -
+    nothing else persists the session.
+
+    Args:
+        filepath: Where to save (a .blend path). Omit to save in place
+                  (fails with guidance if the session was never saved).
+        copy: Save a snapshot copy without retargeting the open session
+
+    Returns:
+        Confirmation with the saved path and size
+    """
+    client = get_blender()
+    kwargs = {"copy": bool(copy)}
+    if filepath:
+        kwargs["filepath"] = filepath
+
+    result = _unwrap(await client.call("save_file", **kwargs))
+    _require_success(result, "Save")
+
+    size_kb = result.get("file_size", 0) / 1024
+    label = "Saved a copy to" if copy else "Saved to"
+    return f"{label}: {result.get('filepath')} ({size_kb:.1f} KB)"
 
 
 # =============================================================================
@@ -682,9 +770,10 @@ async def blender_frame_camera(
     _require_success(result, "Camera framing")
 
     framed = ", ".join(result.get("targets", []))
+    dist = float(result.get("distance") or 0.0)
     return (
         f"Camera '{result.get('camera')}' framed [{framed}] from "
-        f"{result.get('distance'):.2f}m (azimuth {azimuth_deg} deg, elevation {elevation_deg} deg). "
+        f"{dist:.2f}m (azimuth {azimuth_deg} deg, elevation {elevation_deg} deg). "
         "Take a blender_screenshot or a draft blender_render to verify the framing."
     )
 
@@ -836,6 +925,12 @@ if obj and hasattr(obj.data, 'materials'):
 # =============================================================================
 
 
+_INTERPOLATION_MODES = (
+    "CONSTANT", "LINEAR", "BEZIER", "SINE", "QUAD", "CUBIC", "QUART",
+    "QUINT", "EXPO", "CIRC", "BACK", "BOUNCE", "ELASTIC",
+)
+
+
 @mcp.tool(annotations=_ADDITIVE)
 async def blender_set_keyframe(
     object_name: str,
@@ -843,6 +938,7 @@ async def blender_set_keyframe(
     location: Optional[list] = None,
     rotation: Optional[list] = None,
     scale: Optional[list] = None,
+    interpolation: str = "BEZIER",
 ) -> str:
     """
     Set a keyframe for an object at a specific frame.
@@ -853,20 +949,27 @@ async def blender_set_keyframe(
         location: Position as [x, y, z] (optional)
         rotation: Rotation in radians as [x, y, z] (optional)
         scale: Scale as [x, y, z] (optional)
+        interpolation: Easing for this keyframe - 'BEZIER' (default ease),
+                       'LINEAR' (constant speed - use for loops/turntables),
+                       'CONSTANT', or other Blender modes
 
     Returns:
         Result message
     """
     frame = int(frame)
+    interpolation = interpolation.upper()
+    if interpolation not in _INTERPOLATION_MODES:
+        raise ToolError(f"interpolation must be one of {_INTERPOLATION_MODES}")
 
     code = f'''
 import bpy
 
 obj = bpy.data.objects.get({object_name!r})
 if not obj:
-    __result__ = "Object " + {object_name!r} + " not found"
+    __result__ = {{"ok": False, "error": "Object " + {object_name!r} + " not found"}}
 else:
-    bpy.context.scene.frame_set({frame})
+    # keyframe_insert(frame=...) records at the target frame directly;
+    # moving the user's playhead with frame_set is neither needed nor polite.
     keyframes_set = []
 '''
 
@@ -892,10 +995,17 @@ else:
 '''
 
     code += f'''
+    if keyframes_set and {interpolation!r} != "BEZIER":
+        anim = obj.animation_data
+        if anim and anim.action:
+            for fc in anim.action.fcurves:
+                for kp in fc.keyframe_points:
+                    if int(round(kp.co.x)) == {frame}:
+                        kp.interpolation = {interpolation!r}
     if keyframes_set:
-        __result__ = "Keyframes set for " + ", ".join(keyframes_set) + " at frame {frame}"
+        __result__ = {{"ok": True, "channels": keyframes_set}}
     else:
-        __result__ = "No properties specified for keyframe"
+        __result__ = {{"ok": False, "error": "No properties specified for keyframe"}}
 '''
 
     client = get_blender()
@@ -903,7 +1013,13 @@ else:
 
     if result.get("error"):
         raise ToolError(f"Keyframe failed: {result['error']}")
-    return result.get("result", "Keyframe operation completed")
+    payload = result.get("result")
+    if not isinstance(payload, dict):
+        raise ToolError(f"Keyframe returned unexpected result: {payload!r}")
+    if not payload.get("ok"):
+        raise ToolError(f"Keyframe failed: {payload.get('error', 'unknown error')}")
+    channels = ", ".join(str(c) for c in payload.get("channels", []))
+    return f"Keyframes set for {channels} at frame {frame} ({interpolation})"
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
@@ -1178,7 +1294,7 @@ async def ai_generate_procedural(
 
     code = f'''
 try:
-    from ai_services.local_text_to_3d import ProceduralGenerator
+    from claude_blender.ai_services.local_text_to_3d import ProceduralGenerator
     gen = ProceduralGenerator()
     result = gen.generate({object_type!r}, size={float(size)!r}, seed={seed!r})
     __result__ = result
@@ -1187,14 +1303,10 @@ except Exception as e:
 '''
 
     client = get_blender()
-    result = _unwrap(await client.execute(code, timeout=300.0)).get("result", {})
-
-    if isinstance(result, dict):
-        if result.get("success"):
-            return f"Generated procedural {object_type}: '{result.get('object_name')}'"
-        raise ToolError(f"Generation failed: {result.get('error', 'Unknown error')}")
-
-    return f"Result: {result}"
+    result = _ai_payload(
+        _unwrap(await client.execute(code, timeout=300.0)), "Procedural generation"
+    )
+    return f"Generated procedural {object_type}: '{result.get('object_name')}'"
 
 
 @mcp.tool(annotations=_ADDITIVE)
@@ -1227,7 +1339,7 @@ async def ai_comfyui_generate(
     """
     code = f'''
 try:
-    from ai_services.comfyui_bridge import get_comfyui
+    from claude_blender.ai_services.comfyui_bridge import get_comfyui
 
     comfy = get_comfyui()
 
@@ -1252,15 +1364,11 @@ except Exception as e:
 '''
 
     client = get_blender()
-    result = _unwrap(await client.execute(code, timeout=900.0)).get("result", {})
-
-    if isinstance(result, dict):
-        if result.get("success"):
-            images = result.get("images", [])
-            return f"Generated image with ComfyUI\nSaved to: {', '.join(images)}"
-        raise ToolError(f"Generation failed: {result.get('error', 'Unknown error')}")
-
-    return f"Result: {result}"
+    result = _ai_payload(
+        _unwrap(await client.execute(code, timeout=900.0)), "ComfyUI generation"
+    )
+    images = result.get("images", [])
+    return f"Generated image with ComfyUI\nSaved to: {', '.join(images)}"
 
 
 @mcp.tool(annotations=_ADDITIVE)
@@ -1291,27 +1399,30 @@ async def ai_local_text_to_3d(
     if provider == "procedural":
         # Map prompt to procedural type
         code = f'''
-prompt_lower = {prompt!r}.lower()
-if any(w in prompt_lower for w in ["rock", "stone", "boulder"]):
-    obj_type = "rock"
-elif any(w in prompt_lower for w in ["tree", "plant", "forest"]):
-    obj_type = "tree"
-elif any(w in prompt_lower for w in ["terrain", "land", "ground", "mountain"]):
-    obj_type = "terrain"
-elif any(w in prompt_lower for w in ["building", "house", "tower"]):
-    obj_type = "building"
-else:
-    obj_type = "rock"  # Default
+try:
+    prompt_lower = {prompt!r}.lower()
+    if any(w in prompt_lower for w in ["rock", "stone", "boulder"]):
+        obj_type = "rock"
+    elif any(w in prompt_lower for w in ["tree", "plant", "forest"]):
+        obj_type = "tree"
+    elif any(w in prompt_lower for w in ["terrain", "land", "ground", "mountain"]):
+        obj_type = "terrain"
+    elif any(w in prompt_lower for w in ["building", "house", "tower"]):
+        obj_type = "building"
+    else:
+        obj_type = "rock"  # Default
 
-from ai_services.local_text_to_3d import ProceduralGenerator
-gen = ProceduralGenerator()
-result = gen.generate(obj_type)
-__result__ = result
+    from claude_blender.ai_services.local_text_to_3d import ProceduralGenerator
+    gen = ProceduralGenerator()
+    result = gen.generate(obj_type)
+    __result__ = result
+except Exception as e:
+    __result__ = {{"success": False, "error": str(e)}}
 '''
     else:
         code = f'''
 try:
-    from ai_services.local_text_to_3d import get_local_text_to_3d
+    from claude_blender.ai_services.local_text_to_3d import get_local_text_to_3d
 
     service = get_local_text_to_3d({provider!r})
 
@@ -1338,21 +1449,17 @@ except Exception as e:
 '''
 
     client = get_blender()
-    result = _unwrap(await client.execute(code, timeout=1800.0)).get("result", {})
-
-    if isinstance(result, dict):
-        if result.get("success"):
-            if result.get("object_name"):
-                return f"Generated procedural object: '{result.get('object_name')}'"
-            objects = result.get("objects", [])
-            return (
-                f"Generated 3D model from: '{prompt}'\n"
-                f"File: {result.get('filepath')}\n"
-                f"Imported: {', '.join(objects) if objects else 'No'}"
-            )
-        raise ToolError(f"Generation failed: {result.get('error', 'Unknown error')}")
-
-    return f"Result: {result}"
+    result = _ai_payload(
+        _unwrap(await client.execute(code, timeout=1800.0)), "Text-to-3D generation"
+    )
+    if result.get("object_name"):
+        return f"Generated procedural object: '{result.get('object_name')}'"
+    objects = result.get("objects", [])
+    return (
+        f"Generated 3D model from: '{prompt}'\n"
+        f"File: {result.get('filepath')}\n"
+        f"Imported: {', '.join(objects) if objects else 'No'}"
+    )
 
 
 @mcp.tool(annotations=_ADDITIVE)
@@ -1384,7 +1491,7 @@ async def ai_local_image_to_3d(
 
     code = f'''
 try:
-    from ai_services.local_image_to_3d import get_local_image_to_3d
+    from claude_blender.ai_services.local_image_to_3d import get_local_image_to_3d
 
     service = get_local_image_to_3d({provider!r})
 
@@ -1410,19 +1517,15 @@ except Exception as e:
 '''
 
     client = get_blender()
-    result = _unwrap(await client.execute(code, timeout=1800.0)).get("result", {})
-
-    if isinstance(result, dict):
-        if result.get("success"):
-            objects = result.get("objects", [])
-            return (
-                f"Converted image to 3D\nSource: {image_path}\n"
-                f"File: {result.get('filepath')}\n"
-                f"Imported: {', '.join(objects) if objects else 'No'}"
-            )
-        raise ToolError(f"Conversion failed: {result.get('error', 'Unknown error')}")
-
-    return f"Result: {result}"
+    result = _ai_payload(
+        _unwrap(await client.execute(code, timeout=1800.0)), "Image-to-3D conversion"
+    )
+    objects = result.get("objects", [])
+    return (
+        f"Converted image to 3D\nSource: {image_path}\n"
+        f"File: {result.get('filepath')}\n"
+        f"Imported: {', '.join(objects) if objects else 'No'}"
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -1468,7 +1571,7 @@ except ImportError:
 
 # Check ComfyUI
 try:
-    from ai_services.comfyui_bridge import get_comfyui
+    from claude_blender.ai_services.comfyui_bridge import get_comfyui
     comfy = get_comfyui()
     if comfy.is_available():
         results["comfyui"] = {"available": True, "note": "Running at localhost:8188"}
@@ -1480,7 +1583,12 @@ except Exception as e:
 __result__ = results
 '''
 
-    result = _unwrap(await client.execute(code, timeout=120.0)).get("result", {})
+    response = _unwrap(await client.execute(code, timeout=120.0))
+    if response.get("error"):
+        raise ToolError(f"Service check failed: {response['error']}")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise ToolError(f"Service check returned an unexpected result: {result!r}")
 
     lines = ["Local AI Services Status:", "=" * 40]
 
@@ -1564,11 +1672,14 @@ def studio_lighting(subject: str = "the active object") -> str:
     return (
         f"Set up three-point studio lighting in Blender around {subject}:\n"
         "1. Inspect the scene (blender_get_scene) and find the subject's location and size.\n"
-        "2. Add a large AREA key light at ~45 degrees front-left, above the subject.\n"
-        "3. Add a softer fill light front-right at roughly half the key's power.\n"
-        "4. Add a rim/back light behind and above to separate the subject from the background.\n"
-        "5. Add a camera framing the subject, take a blender_screenshot, and adjust "
-        "light power/positions based on what you see."
+        "2. Key: blender_add_object type 'area' at ~45 degrees front-left above the "
+        "subject, with energy ~800, a warm color, and size about the subject's "
+        "largest dimension (bigger = softer shadows).\n"
+        "3. Fill: another 'area' front-right, energy about half the key's, larger size.\n"
+        "4. Rim: a light behind and above with a cool color, to separate the subject "
+        "from the background.\n"
+        "5. blender_frame_camera on the subject, take a blender_screenshot, and adjust "
+        "light energy/positions based on what you see."
     )
 
 
@@ -1580,10 +1691,13 @@ def turntable_animation(object_name: str, seconds: int = 4, fps: int = 24) -> st
         f"Create a {seconds}s turntable animation of '{object_name}':\n"
         f"1. Verify the object exists with blender_get_object.\n"
         f"2. Set the frame range to 1-{frames} with blender_set_frame_range.\n"
-        f"3. Add an empty at the object's location, parent a camera to it aimed at the object.\n"
-        f"4. Keyframe the empty's Z rotation: 0 at frame 1, 2*pi at frame {frames} "
-        "(blender_set_keyframe or blender_execute), and set linear interpolation.\n"
-        "5. Take a screenshot at a mid frame to verify framing before rendering."
+        f"3. Add an empty at the object's location, aim the camera with "
+        "blender_frame_camera, then parent the camera to the empty "
+        "(blender_organize action='parent').\n"
+        f"4. Keyframe the empty's Z rotation with interpolation='LINEAR': "
+        f"0 at frame 1, 2*pi at frame {frames} (blender_set_keyframe).\n"
+        "5. Take a screenshot at a mid frame to verify framing, then render "
+        "with blender_render_animation."
     )
 
 

@@ -26,6 +26,31 @@ class CommandExecutor:
         self.last_result: Any = None
         self.execution_count: int = 0
 
+    def _ensure_object_mode(self) -> Optional[str]:
+        """Force Object Mode before object-level operations.
+
+        In Edit Mode, mesh.primitive_*_add operators weld geometry INTO the
+        mesh being edited and bpy.context.active_object points at the user's
+        object - so proceeding would corrupt unrelated data.
+
+        Returns an error string, or None when it is safe to proceed.
+        """
+        try:
+            if bpy.context.mode == 'OBJECT':
+                return None
+            wm = bpy.context.window_manager
+            if wm and wm.windows:
+                win = wm.windows[0]
+                with bpy.context.temp_override(window=win, screen=win.screen):
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            else:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            if bpy.context.mode != 'OBJECT':
+                return f"Blender is in {bpy.context.mode} mode; switch to Object Mode first"
+            return None
+        except Exception as e:
+            return f"Cannot switch to Object Mode ({type(e).__name__}: {e})"
+
     def execute_python(self, code: str, capture_output: bool = True) -> Dict[str, Any]:
         """
         Execute arbitrary Python code.
@@ -66,13 +91,15 @@ class CommandExecutor:
             else:
                 exec(compiled, namespace)
 
-            # Get result (if code sets __result__)
-            result = namespace.get('__result__')
-            self.last_result = result
+            # Get result (if code sets __result__). Keep only the serialized
+            # form: raw bpy references become dangling StructRNA pointers
+            # after an undo frees the main database.
+            serialized = self._serialize_result(namespace.get('__result__'))
+            self.last_result = serialized
 
             return {
                 'success': True,
-                'result': self._serialize_result(result),
+                'result': serialized,
                 'output': stdout_capture.getvalue(),
                 'error': None
             }
@@ -166,6 +193,9 @@ class CommandExecutor:
         location: Tuple[float, float, float] = (0, 0, 0),
         rotation: Tuple[float, float, float] = (0, 0, 0),
         scale: Tuple[float, float, float] = (1, 1, 1),
+        energy: Optional[float] = None,
+        color: Optional[Tuple[float, float, float]] = None,
+        size: Optional[float] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -177,11 +207,17 @@ class CommandExecutor:
             location: Object location
             rotation: Object rotation (radians)
             scale: Object scale
+            energy: Light power in watts (lights only)
+            color: Light color [r, g, b] 0-1 (lights only)
+            size: Light size/softness in meters (lights only)
             **kwargs: Additional operator arguments
 
         Returns:
             Dict with object info or error
         """
+        mode_error = self._ensure_object_mode()
+        if mode_error:
+            return {'success': False, 'object_name': None, 'error': mode_error}
         # Map type names to operators
         type_map = {
             'cube': 'mesh.primitive_cube_add',
@@ -243,6 +279,18 @@ class CommandExecutor:
         if obj and tuple(scale) != (1, 1, 1):
             obj.scale = scale
 
+        # Light data lives on obj.data, out of the add operator's reach
+        if obj and obj.type == 'LIGHT':
+            if energy is not None:
+                obj.data.energy = float(energy)
+            if color is not None:
+                obj.data.color = tuple(float(c) for c in color[:3])
+            if size is not None:
+                if hasattr(obj.data, 'size'):        # AREA
+                    obj.data.size = float(size)
+                else:                                # POINT/SUN/SPOT softness
+                    obj.data.shadow_soft_size = float(size)
+
         return {
             'success': True,
             'object_name': obj.name if obj else None,
@@ -257,7 +305,8 @@ class CommandExecutor:
         location: Optional[Tuple[float, float, float]] = None,
         rotation: Optional[Tuple[float, float, float]] = None,
         scale: Optional[Tuple[float, float, float]] = None,
-        visible: Optional[bool] = None
+        visible: Optional[bool] = None,
+        shade_smooth: Optional[bool] = None
     ) -> Dict[str, Any]:
         """
         Modify an existing object's properties.
@@ -268,6 +317,7 @@ class CommandExecutor:
             rotation: New rotation in radians (or None)
             scale: New scale (or None)
             visible: Visibility (or None)
+            shade_smooth: Smooth (True) or flat (False) shading for meshes
 
         Returns:
             Dict with success status
@@ -289,6 +339,12 @@ class CommandExecutor:
             if visible is not None:
                 obj.hide_viewport = not visible
                 obj.hide_render = not visible
+            if shade_smooth is not None:
+                if obj.type != 'MESH':
+                    return {'success': False,
+                            'error': f'shade_smooth needs a MESH object, got {obj.type}'}
+                for poly in obj.data.polygons:
+                    poly.use_smooth = bool(shade_smooth)
 
             return {
                 'success': True,
@@ -307,6 +363,10 @@ class CommandExecutor:
 
     def delete_object(self, name: str) -> Dict[str, Any]:
         """Delete an object by name."""
+        mode_error = self._ensure_object_mode()
+        if mode_error:
+            return {'success': False, 'error': mode_error}
+
         obj = bpy.data.objects.get(name)
         if not obj:
             return {
@@ -391,6 +451,10 @@ class CommandExecutor:
 
     def apply_modifier(self, object_name: str, modifier_name: str) -> Dict[str, Any]:
         """Apply (bake) a modifier into the object's mesh data."""
+        mode_error = self._ensure_object_mode()
+        if mode_error:
+            return {'success': False, 'error': mode_error}
+
         obj = bpy.data.objects.get(object_name)
         if not obj:
             return {'success': False, 'error': f'Object not found: {object_name}'}
@@ -438,6 +502,10 @@ class CommandExecutor:
         """
         from mathutils import Vector
 
+        mode_error = self._ensure_object_mode()
+        if mode_error:
+            return {'success': False, 'error': mode_error}
+
         src = bpy.data.objects.get(name)
         if not src:
             return {'success': False, 'error': f'Object not found: {name}'}
@@ -483,9 +551,19 @@ class CommandExecutor:
                 missing.append(child_name)
                 continue
             if parent is not None:
+                # A parent that descends from the child would create a
+                # dependency cycle - direct assignment has no operator check.
+                ancestor = parent
+                while ancestor is not None:
+                    if ancestor == child:
+                        return {'success': False, 'changed': changed,
+                                'error': f"Parenting '{child_name}' to "
+                                         f"'{parent_name}' would create a cycle"}
+                    ancestor = ancestor.parent
                 child.parent = parent
                 if keep_transform:
-                    child.matrix_parent_inverse = parent.matrix_world.inverted()
+                    # inverted_safe() tolerates singular matrices (zero scale)
+                    child.matrix_parent_inverse = parent.matrix_world.inverted_safe()
             else:
                 if keep_transform:
                     world = child.matrix_world.copy()

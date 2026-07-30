@@ -7,9 +7,49 @@ Provides scene introspection and serialization.
 
 import os
 import tempfile
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import bpy
+
+
+@contextmanager
+def _render_state(scene):
+    """Save and restore every render setting our handlers touch.
+
+    Render parameters passed to a tool call are per-call overrides; the
+    user's scene configuration must survive the call - including when it
+    raises (e.g. a bad engine name or a failed OpenGL capture).
+    """
+    r = scene.render
+    saved = {
+        'engine': r.engine,
+        'resolution_x': r.resolution_x,
+        'resolution_y': r.resolution_y,
+        'resolution_percentage': r.resolution_percentage,
+        'file_format': r.image_settings.file_format,
+        'filepath': r.filepath,
+        'fps': r.fps,
+        'frame_current': scene.frame_current,
+    }
+    cycles_samples = getattr(getattr(scene, 'cycles', None), 'samples', None)
+    eevee_samples = getattr(getattr(scene, 'eevee', None), 'taa_render_samples', None)
+    try:
+        yield
+    finally:
+        r.engine = saved['engine']  # restore engine first: samples live on it
+        r.resolution_x = saved['resolution_x']
+        r.resolution_y = saved['resolution_y']
+        r.resolution_percentage = saved['resolution_percentage']
+        r.image_settings.file_format = saved['file_format']
+        r.filepath = saved['filepath']
+        r.fps = saved['fps']
+        # An animation render walks the playhead to its last frame
+        scene.frame_current = saved['frame_current']
+        if cycles_samples is not None:
+            scene.cycles.samples = cycles_samples
+        if eevee_samples is not None:
+            scene.eevee.taa_render_samples = eevee_samples
 
 
 class SceneSerializer:
@@ -26,6 +66,7 @@ class SceneSerializer:
             Dict containing scene information
         """
         scene = bpy.context.scene
+        active = bpy.context.view_layer.objects.active
 
         info = {
             'name': scene.name,
@@ -34,6 +75,7 @@ class SceneSerializer:
             'frame_end': scene.frame_end,
             'fps': scene.render.fps,
             'object_count': len(scene.objects),
+            'active_object': active.name if active else None,
         }
 
         if detail_level in ('basic', 'detailed', 'full'):
@@ -111,32 +153,37 @@ class SceneSerializer:
             filepath = os.path.join(tempfile.gettempdir(), 'blender_viewport.png')
 
         try:
+            screen = getattr(bpy.context, 'screen', None)
+            if screen is None:
+                return {'success': False,
+                        'error': 'No screen available (headless Blender has no viewport)'}
+
             # Find 3D viewport area
-            for area in bpy.context.screen.areas:
+            for area in screen.areas:
                 if area.type == 'VIEW_3D':
-                    # Use OpenGL render
+                    region = next(
+                        (r for r in area.regions if r.type == 'WINDOW'),
+                        area.regions[-1],
+                    )
                     override = bpy.context.copy()
                     override['area'] = area
-                    override['region'] = area.regions[-1]
+                    override['region'] = region
 
-                    # Store current resolution
-                    old_x = bpy.context.scene.render.resolution_x
-                    old_y = bpy.context.scene.render.resolution_y
+                    scene = bpy.context.scene
+                    with _render_state(scene):
+                        scene.render.resolution_x = width
+                        scene.render.resolution_y = height
+                        scene.render.resolution_percentage = 100
+                        # save_render honors image_settings; a prior animation
+                        # render leaves a movie format behind, which cannot
+                        # write a single image.
+                        scene.render.image_settings.file_format = 'PNG'
 
-                    # Set capture resolution
-                    bpy.context.scene.render.resolution_x = width
-                    bpy.context.scene.render.resolution_y = height
-
-                    # Capture
-                    with bpy.context.temp_override(**override):
-                        bpy.ops.render.opengl(write_still=True)
-
-                    # Save
-                    bpy.data.images['Render Result'].save_render(filepath)
-
-                    # Restore resolution
-                    bpy.context.scene.render.resolution_x = old_x
-                    bpy.context.scene.render.resolution_y = old_y
+                        # No write_still: it would clobber whatever file
+                        # scene.render.filepath currently points at.
+                        with bpy.context.temp_override(**override):
+                            bpy.ops.render.opengl()
+                        bpy.data.images['Render Result'].save_render(filepath)
 
                     return {
                         'success': True,
@@ -183,37 +230,41 @@ class SceneSerializer:
         try:
             scene = bpy.context.scene
 
-            # Set engine if specified
-            if engine:
-                scene.render.engine = engine
+            # All parameters are per-call overrides; the user's settings
+            # are restored afterwards, success or failure.
+            with _render_state(scene):
+                if engine:
+                    scene.render.engine = engine
 
-            # Set samples if specified
-            if samples and scene.render.engine == 'CYCLES':
-                scene.cycles.samples = samples
+                if samples:
+                    if scene.render.engine == 'CYCLES':
+                        scene.cycles.samples = int(samples)
+                    elif scene.render.engine.startswith('BLENDER_EEVEE'):
+                        scene.eevee.taa_render_samples = int(samples)
 
-            # Set resolution if specified (100% scale so it applies exactly)
-            if resolution_x:
-                scene.render.resolution_x = int(resolution_x)
-            if resolution_y:
-                scene.render.resolution_y = int(resolution_y)
-            if resolution_x or resolution_y:
-                scene.render.resolution_percentage = 100
+                # Set resolution if specified (100% scale so it applies exactly)
+                if resolution_x:
+                    scene.render.resolution_x = int(resolution_x)
+                if resolution_y:
+                    scene.render.resolution_y = int(resolution_y)
+                if resolution_x or resolution_y:
+                    scene.render.resolution_percentage = 100
 
-            # A prior animation render may have left a movie format selected,
-            # which write_still cannot use.
-            scene.render.image_settings.file_format = 'PNG'
+                # A prior animation render may have left a movie format
+                # selected, which write_still cannot use.
+                scene.render.image_settings.file_format = 'PNG'
 
-            # Set output path
-            scene.render.filepath = filepath
+                scene.render.filepath = filepath
+                bpy.ops.render.render(write_still=True)
 
-            # Render
-            bpy.ops.render.render(write_still=True)
+                engine_used = scene.render.engine
+                resolution = [scene.render.resolution_x, scene.render.resolution_y]
 
             return {
                 'success': True,
                 'filepath': filepath,
-                'engine': scene.render.engine,
-                'resolution': [scene.render.resolution_x, scene.render.resolution_y]
+                'engine': engine_used,
+                'resolution': resolution
             }
 
         except Exception as e:
@@ -272,50 +323,64 @@ class SceneSerializer:
             }
 
         try:
-            scene.frame_start = start
-            scene.frame_end = end
-            if fps:
-                scene.render.fps = int(fps)
-            if engine:
-                scene.render.engine = engine
-            if samples:
-                if scene.render.engine == 'CYCLES':
-                    scene.cycles.samples = int(samples)
-                elif scene.render.engine.startswith('BLENDER_EEVEE'):
-                    scene.eevee.taa_render_samples = int(samples)
-            if resolution_x:
-                scene.render.resolution_x = int(resolution_x)
-            if resolution_y:
-                scene.render.resolution_y = int(resolution_y)
-            if resolution_x or resolution_y:
-                scene.render.resolution_percentage = 100
+            # All parameters (frame range included) are per-call overrides;
+            # _render_state and the finally below restore the user's scene.
+            with _render_state(scene):
+                scene.frame_start = start
+                scene.frame_end = end
+                if fps:
+                    scene.render.fps = int(fps)
+                if engine:
+                    scene.render.engine = engine
+                if samples:
+                    if scene.render.engine == 'CYCLES':
+                        scene.cycles.samples = int(samples)
+                    elif scene.render.engine.startswith('BLENDER_EEVEE'):
+                        scene.eevee.taa_render_samples = int(samples)
+                if resolution_x:
+                    scene.render.resolution_x = int(resolution_x)
+                if resolution_y:
+                    scene.render.resolution_y = int(resolution_y)
+                if resolution_x or resolution_y:
+                    scene.render.resolution_percentage = 100
 
-            if container == 'MP4':
-                if filepath is None:
-                    filepath = os.path.join(tempfile.gettempdir(), 'blender_animation.mp4')
-                filepath = os.path.abspath(os.path.expanduser(filepath))
-                stem = filepath[:-4] if filepath.lower().endswith('.mp4') else filepath
+                if container == 'MP4':
+                    if filepath is None:
+                        filepath = os.path.join(tempfile.gettempdir(), 'blender_animation.mp4')
+                    # bpy.path.abspath resolves Blender's '//' (blend-relative)
+                    # prefix, which os.path.abspath would preserve literally.
+                    filepath = os.path.abspath(bpy.path.abspath(os.path.expanduser(filepath)))
+                    stem = filepath[:-4] if filepath.lower().endswith('.mp4') else filepath
+                    if '#' in os.path.basename(stem):
+                        return {'success': False,
+                                'error': "'#' in the output name conflicts with "
+                                         "Blender's frame-number substitution; "
+                                         "use a plain filename"}
 
-                scene.render.image_settings.file_format = 'FFMPEG'
-                scene.render.ffmpeg.format = 'MPEG4'
-                scene.render.ffmpeg.codec = 'H264'
-                scene.render.ffmpeg.constant_rate_factor = 'HIGH'
-                scene.render.ffmpeg.audio_codec = 'NONE'
-                # Blender appends the frame range to the stem for video output.
-                scene.render.filepath = stem
-                expected = f'{stem}{start:04d}-{end:04d}.mp4'
-            else:
-                if filepath is None:
-                    filepath = os.path.join(tempfile.gettempdir(), 'blender_animation_frames')
-                filepath = os.path.abspath(os.path.expanduser(filepath))
-                os.makedirs(filepath, exist_ok=True)
-                scene.render.image_settings.file_format = 'PNG'
-                scene.render.filepath = os.path.join(filepath, 'frame_####')
-                expected = filepath
+                    scene.render.image_settings.file_format = 'FFMPEG'
+                    scene.render.ffmpeg.format = 'MPEG4'
+                    scene.render.ffmpeg.codec = 'H264'
+                    scene.render.ffmpeg.constant_rate_factor = 'HIGH'
+                    scene.render.ffmpeg.audio_codec = 'NONE'
+                    # Blender appends the frame range to the stem for video output.
+                    scene.render.filepath = stem
+                    expected = f'{stem}{start:04d}-{end:04d}.mp4'
+                else:
+                    if filepath is None:
+                        filepath = os.path.join(tempfile.gettempdir(), 'blender_animation_frames')
+                    filepath = os.path.abspath(bpy.path.abspath(os.path.expanduser(filepath)))
+                    os.makedirs(filepath, exist_ok=True)
+                    scene.render.image_settings.file_format = 'PNG'
+                    scene.render.filepath = os.path.join(filepath, 'frame_####')
+                    expected = filepath
 
-            started = time.monotonic()
-            bpy.ops.render.render(animation=True)
-            elapsed = time.monotonic() - started
+                started = time.monotonic()
+                bpy.ops.render.render(animation=True)
+                elapsed = time.monotonic() - started
+
+                fps_used = scene.render.fps
+                engine_used = scene.render.engine
+                resolution = [scene.render.resolution_x, scene.render.resolution_y]
 
             final_path = expected
             if container == 'MP4':
@@ -335,9 +400,9 @@ class SceneSerializer:
                 'frame_start': start,
                 'frame_end': end,
                 'frame_count': frame_count,
-                'fps': scene.render.fps,
-                'engine': scene.render.engine,
-                'resolution': [scene.render.resolution_x, scene.render.resolution_y],
+                'fps': fps_used,
+                'engine': engine_used,
+                'resolution': resolution,
                 'render_time_seconds': round(elapsed, 1),
             }
 
@@ -346,6 +411,51 @@ class SceneSerializer:
         finally:
             # The frame range override is per-call; don't leak it into the scene.
             scene.frame_start, scene.frame_end = orig_range
+
+    def save_file(
+        self,
+        filepath: Optional[str] = None,
+        copy: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Save the current .blend file.
+
+        Args:
+            filepath: Where to save; defaults to the file's current path
+            copy: Save a copy without switching the session to the new path
+
+        Returns:
+            Dict with the saved path
+        """
+        try:
+            if filepath:
+                filepath = os.path.abspath(bpy.path.abspath(os.path.expanduser(filepath)))
+                if not filepath.lower().endswith('.blend'):
+                    filepath += '.blend'
+                out_dir = os.path.dirname(filepath)
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                bpy.ops.wm.save_as_mainfile(filepath=filepath, copy=bool(copy))
+                saved_path = filepath
+            else:
+                if not bpy.data.filepath:
+                    return {'success': False,
+                            'error': 'This session has never been saved; '
+                                     'provide a filepath'}
+                bpy.ops.wm.save_mainfile()
+                saved_path = bpy.data.filepath
+
+            if not os.path.isfile(saved_path):
+                return {'success': False,
+                        'error': f'Save reported success but no file at {saved_path}'}
+            return {
+                'success': True,
+                'filepath': saved_path,
+                'copy': bool(copy),
+                'file_size': os.path.getsize(saved_path),
+            }
+        except Exception as e:
+            return {'success': False, 'error': f'{type(e).__name__}: {e}'}
 
     def _get_objects_list(self, scene, detail_level: str) -> List[Dict]:
         """Get list of objects in the scene."""

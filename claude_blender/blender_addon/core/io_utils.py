@@ -70,7 +70,7 @@ def import_model(filepath: str, format: Optional[str] = None) -> Dict[str, Any]:
     Returns:
         Dict with success, objects_added (names) and filepath
     """
-    filepath = os.path.abspath(os.path.expanduser(filepath))
+    filepath = os.path.abspath(bpy.path.abspath(os.path.expanduser(filepath)))
     if not os.path.isfile(filepath):
         return {'success': False, 'error': f'File not found: {filepath}'}
 
@@ -120,8 +120,14 @@ def export_model(
     Returns:
         Dict with success, filepath, exported object count and file size
     """
-    filepath = os.path.abspath(os.path.expanduser(filepath))
+    filepath = os.path.abspath(bpy.path.abspath(os.path.expanduser(filepath)))
     ext = _extension(filepath, format)
+    # When an explicit format overrides a mismatched extension, rename the
+    # output to match - exporters write by their own format, and a stale
+    # extension would fail the success check below.
+    if format and not filepath.lower().endswith(ext):
+        filepath = os.path.splitext(filepath)[0] + ext
+
     entry = _EXPORTERS.get(ext)
     if not entry:
         return {
@@ -146,22 +152,41 @@ def export_model(
     kwargs = dict(extra)
     exported_count = len(bpy.context.scene.objects)
 
-    if objects:
-        missing = [n for n in objects if n not in bpy.data.objects]
-        if missing:
-            return {'success': False, 'error': f'Objects not found: {", ".join(missing)}'}
-        for obj in bpy.context.scene.objects:
-            obj.select_set(False)
-        for name in objects:
-            bpy.data.objects[name].select_set(True)
-        bpy.context.view_layer.objects.active = bpy.data.objects[objects[0]]
-        kwargs[selection_flag] = True
-        exported_count = len(objects)
+    view_layer = bpy.context.view_layer
+    prev_selected = [o.name for o in bpy.context.selected_objects]
+    prev_active = view_layer.objects.active
 
     try:
-        op(filepath=filepath, **kwargs)
-    except Exception as e:
-        return {'success': False, 'error': f'{type(e).__name__}: {e}'}
+        if objects:
+            missing = [n for n in objects if n not in bpy.data.objects]
+            if missing:
+                return {'success': False, 'error': f'Objects not found: {", ".join(missing)}'}
+            try:
+                for obj in bpy.context.scene.objects:
+                    obj.select_set(False)
+                for name in objects:
+                    bpy.data.objects[name].select_set(True)
+                view_layer.objects.active = bpy.data.objects[objects[0]]
+            except RuntimeError as e:
+                return {'success': False,
+                        'error': f'Cannot select for export (object not in the '
+                                 f'current view layer?): {e}'}
+            kwargs[selection_flag] = True
+            exported_count = len(objects)
+
+        try:
+            op(filepath=filepath, **kwargs)
+        except Exception as e:
+            return {'success': False, 'error': f'{type(e).__name__}: {e}'}
+    finally:
+        # The user's selection is not ours to keep.
+        if objects:
+            try:
+                for obj in bpy.context.scene.objects:
+                    obj.select_set(obj.name in prev_selected)
+                view_layer.objects.active = prev_active
+            except Exception:
+                pass
 
     if not os.path.isfile(filepath):
         return {'success': False, 'error': f'Exporter finished but no file at {filepath}'}

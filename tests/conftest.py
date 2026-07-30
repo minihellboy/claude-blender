@@ -12,7 +12,9 @@ import base64
 import json
 import os
 import socket
+import sys
 import tempfile
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -21,6 +23,41 @@ PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
     "h6FO1AAAAABJRU5ErkJggg=="
 )
+
+
+def _install_stub_modules():
+    """Stub the modules generated code imports inside Blender.
+
+    This lets the fake server EXECUTE every payload instead of merely
+    compiling it - compile() cannot catch a wrong import path (that is how
+    five broken ai_* tools once shipped green).
+    """
+    for mod in ("bpy", "mathutils",
+                "claude_blender",
+                "claude_blender.ai_services",
+                "claude_blender.ai_services.local_text_to_3d",
+                "claude_blender.ai_services.local_image_to_3d",
+                "claude_blender.ai_services.comfyui_bridge"):
+        sys.modules.setdefault(mod, MagicMock(name=mod))
+
+    ltt = sys.modules["claude_blender.ai_services.local_text_to_3d"]
+    ltt.ProceduralGenerator.return_value.generate.return_value = {
+        "success": True, "object_name": "Generated_Rock",
+    }
+
+
+_install_stub_modules()
+
+
+def _jsonable(value):
+    """Mirror the executor's serialization: JSON types pass, the rest str()."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    return str(value)
 
 
 def _free_port() -> int:
@@ -88,10 +125,19 @@ class FakeBlender:
         code = params["code"]
         self.received_code.append(code)
         try:
-            compile(code, "<generated>", "exec")  # the injection check
-            return {"success": True, "result": "compiled-ok", "output": ""}
+            compiled = compile(code, "<generated>", "exec")  # injection check
         except SyntaxError as e:
             return {"success": False, "error": f"SyntaxError: {e}"}
+        # Execute like the real executor does - a payload that only compiles
+        # can still crash at runtime (wrong imports, bad attribute paths).
+        namespace = {"__result__": None}
+        try:
+            exec(compiled, namespace)
+        except Exception as e:
+            return {"success": False, "result": None, "output": "",
+                    "error": f"{type(e).__name__}: {e}"}
+        return {"success": True, "result": _jsonable(namespace.get("__result__")),
+                "output": ""}
 
     # --- scene -------------------------------------------------------------
 
@@ -104,7 +150,8 @@ class FakeBlender:
     def _h_get_object(self, params):
         return {
             "name": params["name"], "type": "MESH",
-            "location": [0, 0, 0], "rotation": [0, 0, 0], "scale": [1, 1, 1],
+            "location": [0, 0, 0], "rotation_euler": [0.0, 0.0, 0.7854],
+            "scale": [1, 1, 1],
             "visible": True, "dimensions": [2, 2, 2], "materials": ["Mat"],
             "mesh": {"vertex_count": 8, "polygon_count": 6, "has_uv": True},
             "modifiers": [{"name": "Subsurf", "type": "SUBSURF", "show_viewport": True}],
@@ -134,6 +181,16 @@ class FakeBlender:
         with open(path, "wb") as f:
             f.write(PNG_BYTES)
         return {"success": True, "filepath": path}
+
+    def _h_save_file(self, params):
+        path = params.get("filepath") or os.path.join(
+            tempfile.gettempdir(), f"fake_blender_{self.port}.blend"
+        )
+        with open(path, "wb") as f:
+            f.write(b"BLENDER-fake")
+        return {"success": True, "filepath": path,
+                "copy": bool(params.get("copy", False)),
+                "file_size": os.path.getsize(path)}
 
     def _h_render_animation(self, params):
         start = int(params.get("frame_start", 1))

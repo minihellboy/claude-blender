@@ -27,6 +27,8 @@ class BlenderServer:
         self._running = False
         self._request_handler: Optional[Callable[[bytes], bytes]] = None
         self._buffer: dict = {}  # Client -> buffer mapping for partial reads
+        self._out: dict = {}     # Client -> pending outgoing bytes (partial writes)
+        self.last_error: Optional[str] = None
 
     def set_request_handler(self, handler: Callable[[bytes], bytes]):
         """Set the handler function for processing requests."""
@@ -45,6 +47,7 @@ class BlenderServer:
             self.socket.bind((self.host, self.port))
             self.socket.listen(5)
             self._running = True
+            self.last_error = None
 
             # Register timer for polling (persistent across file loads)
             bpy.app.timers.register(self._poll, persistent=True)
@@ -53,6 +56,7 @@ class BlenderServer:
             return True
 
         except Exception as e:
+            self.last_error = str(e)
             print(f"[Claude Blender] Failed to start server: {e}")
             self._cleanup()
             return False
@@ -73,6 +77,7 @@ class BlenderServer:
                 pass
         self.clients.clear()
         self._buffer.clear()
+        self._out.clear()
 
         # Close server socket
         if self.socket:
@@ -131,6 +136,10 @@ class BlenderServer:
                 print(f"[Claude Blender] Client error: {e}")
                 self._remove_client(client)
 
+        # Drain pending partial writes (large responses span multiple polls)
+        for client in list(self._out):
+            self._flush(client)
+
         return 0.016  # Poll at ~60 Hz
 
     def _handle_message(self, client: socket.socket, message: bytes):
@@ -138,23 +147,54 @@ class BlenderServer:
         if self._request_handler:
             try:
                 response = self._request_handler(message)
-                client.send(response + b'\n')
             except Exception as e:
-                error_response = json.dumps({
+                response = json.dumps({
                     "jsonrpc": "2.0",
                     "error": {"code": -32000, "message": str(e)},
                     "id": None
                 }).encode()
-                client.send(error_response + b'\n')
+            if response:
+                self._queue_send(client, response + b'\n')
         else:
             print("[Claude Blender] No request handler set")
+
+    def _queue_send(self, client: socket.socket, data: bytes):
+        """Queue data for a client and flush as much as the socket accepts.
+
+        A non-blocking send() writes only what fits in the kernel buffer;
+        the remainder is kept here and drained on subsequent polls, so large
+        responses are never silently truncated.
+        """
+        self._out[client] = self._out.get(client, b'') + data
+        self._flush(client)
+
+    def _flush(self, client: socket.socket):
+        """Send as much pending output as the socket will take right now."""
+        buf = self._out.get(client)
+        if not buf:
+            return
+        try:
+            while buf:
+                sent = client.send(buf)
+                if sent <= 0:
+                    break
+                buf = buf[sent:]
+        except BlockingIOError:
+            pass  # Kernel buffer full; retry on the next poll
+        except OSError:
+            self._remove_client(client)
+            return
+        if buf:
+            self._out[client] = buf
+        else:
+            self._out.pop(client, None)
 
     def _remove_client(self, client: socket.socket):
         """Remove a client and clean up its resources."""
         if client in self.clients:
             self.clients.remove(client)
-        if client in self._buffer:
-            del self._buffer[client]
+        self._buffer.pop(client, None)
+        self._out.pop(client, None)
         try:
             client.close()
         except:
