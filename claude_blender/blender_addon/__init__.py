@@ -9,7 +9,7 @@ with integrations for text-to-3D, image-to-3D, AI textures, and more.
 bl_info = {
     "name": "Claude Blender",
     "author": "Claude Code",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Claude",
     "description": "AI-powered Blender control via Claude Code",

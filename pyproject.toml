@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-blender"
-version = "0.1.0"
+version = "0.2.0"
 description = "Claude Code MCP server for Blender integration"
 readme = "README.md"
 license = {text = "MIT"}
@@ -25,30 +25,26 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=2.0.0,<3",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
-ai = [
-    "httpx>=0.25.0",
-    "replicate>=0.20.0",
-]
 
 [project.scripts]
-claude-blender = "mcp_server:main"
+claude-blender = "claude_blender_mcp:main"
 
 [project.urls]
-Homepage = "https://github.com/example/claude-blender"
-Documentation = "https://github.com/example/claude-blender#readme"
-Repository = "https://github.com/example/claude-blender"
+Homepage = "https://github.com/minihellboy/claude-blender"
+Documentation = "https://github.com/minihellboy/claude-blender#readme"
+Repository = "https://github.com/minihellboy/claude-blender"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["mcp_server*"]
+[tool.setuptools]
+packages = ["claude_blender_mcp"]
+package-dir = {"claude_blender_mcp" = "claude_blender/claude_blender_mcp"}
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

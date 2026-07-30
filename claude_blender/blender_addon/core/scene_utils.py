@@ -152,7 +152,9 @@ class SceneSerializer:
         self,
         filepath: Optional[str] = None,
         engine: Optional[str] = None,
-        samples: Optional[int] = None
+        samples: Optional[int] = None,
+        resolution_x: Optional[int] = None,
+        resolution_y: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Render the scene to an image.
@@ -161,6 +163,8 @@ class SceneSerializer:
             filepath: Output path
             engine: Render engine ('CYCLES', 'BLENDER_EEVEE', etc.)
             samples: Number of samples (for Cycles)
+            resolution_x: Output width in pixels
+            resolution_y: Output height in pixels
 
         Returns:
             Dict with filepath and success status
@@ -178,6 +182,14 @@ class SceneSerializer:
             # Set samples if specified
             if samples and scene.render.engine == 'CYCLES':
                 scene.cycles.samples = samples
+
+            # Set resolution if specified (100% scale so it applies exactly)
+            if resolution_x:
+                scene.render.resolution_x = int(resolution_x)
+            if resolution_y:
+                scene.render.resolution_y = int(resolution_y)
+            if resolution_x or resolution_y:
+                scene.render.resolution_percentage = 100
 
             # Set output path
             scene.render.filepath = filepath

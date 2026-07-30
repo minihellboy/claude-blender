@@ -7,23 +7,24 @@ See the main [README.md](../README.md) in the parent directory for full document
 ## Quick Start
 
 ### Install
+From the repository root (uv project):
 ```bash
-pip install -e .
+uv sync
 ```
 
 ### Test Connection
 ```bash
-python test_client.py
+uv run python test_client.py
 ```
 
 ### Interactive Mode
 ```bash
-python test_client.py -i
+uv run python test_client.py -i
 ```
 
 ## Package Structure
 
 - `blender_addon/` - The Blender addon (install in Blender)
-- `mcp_server/` - MCP server for Claude Code integration
+- `claude_blender_mcp/` - MCP server for Claude Code integration (MCP SDK v2)
 - `test_client.py` - Test script for verifying connection
 - `demo_creative.py` - Creative demo showcasing capabilities

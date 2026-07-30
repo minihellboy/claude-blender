@@ -3,10 +3,16 @@
 Client for communicating with the Blender addon server.
 """
 
-import socket
 import json
+import sys
 from typing import Any, Dict, Optional
 import asyncio
+
+# Scene dumps at detail_level='full' can be large; the asyncio default of 64 KiB
+# would raise LimitOverrunError on a single long response line.
+_STREAM_LIMIT = 16 * 1024 * 1024
+
+DEFAULT_TIMEOUT = 30.0
 
 
 class BlenderClient:
@@ -28,12 +34,13 @@ class BlenderClient:
         """Connect to the Blender server."""
         try:
             self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port),
+                asyncio.open_connection(self.host, self.port, limit=_STREAM_LIMIT),
                 timeout=5.0
             )
             return True
         except Exception as e:
-            print(f"[BlenderClient] Connection failed: {e}")
+            # stdout carries the MCP stdio protocol; diagnostics must go to stderr.
+            print(f"[BlenderClient] Connection failed: {e}", file=sys.stderr)
             return False
 
     async def disconnect(self):
@@ -42,7 +49,7 @@ class BlenderClient:
             self._writer.close()
             try:
                 await self._writer.wait_closed()
-            except:
+            except Exception:
                 pass
         self._reader = None
         self._writer = None
@@ -53,12 +60,19 @@ class BlenderClient:
             return await self.connect()
         return True
 
-    async def call(self, method: str, **params) -> Dict[str, Any]:
+    async def call(
+        self,
+        method: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        **params,
+    ) -> Dict[str, Any]:
         """
         Call a JSON-RPC method on the Blender server.
 
         Args:
             method: Method name
+            timeout: Seconds to wait for the response before giving up
             **params: Method parameters
 
         Returns:
@@ -85,7 +99,7 @@ class BlenderClient:
                 # Read response
                 response_data = await asyncio.wait_for(
                     self._reader.readline(),
-                    timeout=30.0
+                    timeout=timeout
                 )
 
                 if not response_data:
@@ -95,19 +109,25 @@ class BlenderClient:
                 return json.loads(response_data.decode())
 
             except asyncio.TimeoutError:
-                return {"error": {"code": -32000, "message": "Request timeout"}}
+                # The late response would desynchronize the next request/response
+                # pair on this socket, so drop the connection along with it.
+                await self.disconnect()
+                return {"error": {"code": -32000, "message": (
+                    f"Request '{method}' timed out after {timeout:.0f}s. "
+                    "Blender may still be processing it; the connection was reset."
+                )}}
             except Exception as e:
                 await self.disconnect()
                 return {"error": {"code": -32000, "message": str(e)}}
 
     async def ping(self) -> bool:
         """Check if Blender is reachable."""
-        response = await self.call("ping")
+        response = await self.call("ping", timeout=5.0)
         return response.get("result") == "pong"
 
-    async def execute(self, code: str) -> Dict[str, Any]:
+    async def execute(self, code: str, timeout: float = 120.0) -> Dict[str, Any]:
         """Execute Python code in Blender."""
-        return await self.call("execute", code=code)
+        return await self.call("execute", timeout=timeout, code=code)
 
     async def get_scene(self, detail_level: str = "basic") -> Dict[str, Any]:
         """Get scene information."""
@@ -141,13 +161,23 @@ class BlenderClient:
         """Get object information."""
         return await self.call("get_object", name=name)
 
-    async def screenshot(self, filepath: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    async def screenshot(
+        self,
+        filepath: Optional[str] = None,
+        timeout: float = 120.0,
+        **kwargs
+    ) -> Dict[str, Any]:
         """Capture viewport screenshot."""
-        return await self.call("screenshot", filepath=filepath, **kwargs)
+        return await self.call("screenshot", timeout=timeout, filepath=filepath, **kwargs)
 
-    async def render(self, filepath: Optional[str] = None, **kwargs) -> Dict[str, Any]:
-        """Render the scene."""
-        return await self.call("render", filepath=filepath, **kwargs)
+    async def render(
+        self,
+        filepath: Optional[str] = None,
+        timeout: float = 1800.0,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Render the scene. Renders block until done, so the timeout is generous."""
+        return await self.call("render", timeout=timeout, filepath=filepath, **kwargs)
 
 
 # Global client instance
@@ -155,8 +185,8 @@ _client: Optional[BlenderClient] = None
 
 
 def get_client(host: str = '127.0.0.1', port: int = 9876) -> BlenderClient:
-    """Get or create the global client instance."""
+    """Get or create the global client instance for the given endpoint."""
     global _client
-    if _client is None:
+    if _client is None or _client.host != host or _client.port != port:
         _client = BlenderClient(host, port)
     return _client

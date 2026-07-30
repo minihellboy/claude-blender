@@ -8,7 +8,7 @@ Control Blender through natural language, execute Python scripts, generate 3D co
 
 ### Core Features
 - **Natural Language Control**: Control Blender via Claude Code commands
-- **MCP Integration**: Full Model Context Protocol support with 20+ tools
+- **MCP Integration**: Built on MCP SDK v2 (protocol 2026-07-28) — 18 tools plus scene resource and workflow prompts, with tool annotations and structured output
 - **JSON-RPC API**: Direct programmatic access to Blender over TCP
 - **Scene Introspection**: Get detailed scene information in multiple formats
 - **Remote Rendering**: Trigger renders and retrieve results
@@ -60,8 +60,7 @@ Control Blender through natural language, execute Python scripts, generate 3D co
 
 ### Prerequisites
 - Blender 4.0+ (tested on 4.3)
-- Python 3.10+
-- pip (for MCP server)
+- [uv](https://docs.astral.sh/uv/) (manages Python 3.10+ and dependencies)
 
 ### 1. Install the Blender Addon
 
@@ -84,34 +83,24 @@ ln -s /path/to/claudeblender/claude_blender/blender_addon \
 
 ### 2. Install the MCP Server
 
+This is a uv project (root `pyproject.toml` + `uv.lock`, built on `mcp>=2.0.0`, MCP protocol revision 2026-07-28). From the repo root:
+
 ```bash
-cd claude_blender
-pip install -e .
+uv sync
 ```
 
-Or install with AI dependencies:
-```bash
-pip install -e ".[ai]"
-```
+That creates `.venv/` and installs the pinned dependencies. Local AI features (Shap-E, TripoSR, etc.) have their own optional dependencies — see [Local AI Services](#local-ai-services) below.
 
 ### 3. Configure Claude Code
 
-Add to your `~/.claude/settings.json`:
+This repository ships a project-scoped `.mcp.json` at the repo root; opening the repo in Claude Code will prompt you to enable the `blender` server. It launches the server with `uv run claude-blender`, so it works as soon as `uv sync` has been run (uv also re-syncs automatically on launch).
 
-```json
-{
-  "mcpServers": {
-    "blender": {
-      "command": "python3",
-      "args": ["-m", "mcp_server"],
-      "cwd": "/path/to/claudeblender/claude_blender",
-      "env": {
-        "BLENDER_HOST": "127.0.0.1",
-        "BLENDER_PORT": "9876"
-      }
-    }
-  }
-}
+To register it user-wide instead (available in every project):
+
+```bash
+claude mcp add --scope user blender \
+  --env BLENDER_HOST=127.0.0.1 --env BLENDER_PORT=9876 \
+  -- uv run --project /path/to/claude-blender claude-blender
 ```
 
 ### 4. Start the Server in Blender
@@ -165,11 +154,11 @@ print(response)
 ### Test Client
 
 ```bash
-# Run all tests
-python claude_blender/test_client.py
+# Run all tests (talks JSON-RPC directly to the addon)
+uv run python claude_blender/test_client.py
 
 # Interactive mode
-python claude_blender/test_client.py -i
+uv run python claude_blender/test_client.py -i
 ```
 
 ## MCP Tools
@@ -197,8 +186,8 @@ python claude_blender/test_client.py -i
 ### Rendering
 | Tool | Description |
 |------|-------------|
-| `blender_screenshot` | Capture viewport |
-| `blender_render` | Render scene with specified settings |
+| `blender_screenshot` | Capture viewport — returns the image inline so Claude can see it |
+| `blender_render` | Render scene — returns the image inline so Claude can see it |
 
 ### Materials & Animation
 | Tool | Description |
@@ -215,6 +204,13 @@ python claude_blender/test_client.py -i
 | `ai_local_image_to_3d` | Image-to-3D with TripoSR (local) |
 | `ai_comfyui_generate` | Generate images via local ComfyUI |
 | `ai_check_local_services` | Check which AI services are available |
+
+### Resources & Prompts
+| Item | Description |
+|------|-------------|
+| `blender://scene` (resource) | Live JSON snapshot of the scene graph |
+| `studio_lighting` (prompt) | Guided three-point lighting workflow |
+| `turntable_animation` (prompt) | Guided 360° turntable animation workflow |
 
 ## Local AI Services
 
@@ -254,15 +250,17 @@ claudeblender/
 │   │       ├── local_image_to_3d.py   # TripoSR, Depth2Mesh
 │   │       └── comfyui_bridge.py      # ComfyUI integration
 │   │
-│   ├── mcp_server/
+│   ├── claude_blender_mcp/
 │   │   ├── __init__.py          # MCP entry point
-│   │   ├── server.py            # FastMCP server with all tools
+│   │   ├── server.py            # MCPServer (MCP SDK v2) with all tools
 │   │   └── blender_client.py    # Async Blender client
 │   │
 │   ├── test_client.py           # Test script
-│   ├── demo_creative.py         # Creative demo script
-│   └── pyproject.toml           # Package configuration
+│   └── demo_creative.py         # Creative demo script
 │
+├── pyproject.toml               # uv project / package configuration
+├── uv.lock                      # Locked dependencies (managed by uv)
+├── .mcp.json                    # Project-scoped Claude Code MCP config
 ├── LICENSE                      # MIT License
 └── README.md                    # This file
 ```
