@@ -9,7 +9,7 @@ with integrations for text-to-3D, image-to-3D, AI textures, and more.
 bl_info = {
     "name": "Claude Blender",
     "author": "Claude Code",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Claude",
     "description": "AI-powered Blender control via Claude Code",
@@ -27,6 +27,7 @@ from .core.server import BlenderServer, get_server
 from .core.protocol import JSONRPCHandler
 from .core.executor import CommandExecutor
 from .core.scene_utils import SceneSerializer
+from .core import io_utils, camera_utils
 
 
 # Global instances
@@ -68,6 +69,29 @@ def _setup_handler():
         # Rendering
         'screenshot': lambda **kwargs: _scene_utils.capture_viewport(**kwargs),
         'render': lambda **kwargs: _scene_utils.render_image(**kwargs),
+        'render_animation': lambda **kwargs: _scene_utils.render_animation(**kwargs),
+
+        # Import / export
+        'import_model': lambda **kwargs: io_utils.import_model(**kwargs),
+        'export_model': lambda **kwargs: io_utils.export_model(**kwargs),
+
+        # Camera
+        'frame_camera': lambda **kwargs: camera_utils.frame_camera(**kwargs),
+
+        # Modifiers
+        'add_modifier': lambda **kwargs: _executor.add_modifier(**kwargs),
+        'apply_modifier': lambda **kwargs: _executor.apply_modifier(**kwargs),
+        'remove_modifier': lambda **kwargs: _executor.remove_modifier(**kwargs),
+
+        # Batch / organization
+        'duplicate_object': lambda **kwargs: _executor.duplicate_object(**kwargs),
+        'set_parent': lambda **kwargs: _executor.set_parent(**kwargs),
+        'move_to_collection': lambda **kwargs: _executor.move_to_collection(**kwargs),
+
+        # Undo stack
+        'checkpoint': lambda **kwargs: _executor.checkpoint(**kwargs),
+        'undo': lambda **kwargs: _executor.undo(**kwargs),
+        'redo': lambda **kwargs: _executor.redo(**kwargs),
     })
 
     # Set handler on server

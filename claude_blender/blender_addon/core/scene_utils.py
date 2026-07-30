@@ -80,6 +80,14 @@ class SceneSerializer:
         if obj.data and hasattr(obj.data, 'materials'):
             info['materials'] = [m.name for m in obj.data.materials if m]
 
+        # Modifier stack and collection membership
+        if hasattr(obj, 'modifiers'):
+            info['modifiers'] = [
+                {'name': m.name, 'type': m.type, 'show_viewport': m.show_viewport}
+                for m in obj.modifiers
+            ]
+        info['collections'] = [c.name for c in obj.users_collection]
+
         return info
 
     def capture_viewport(
@@ -191,6 +199,10 @@ class SceneSerializer:
             if resolution_x or resolution_y:
                 scene.render.resolution_percentage = 100
 
+            # A prior animation render may have left a movie format selected,
+            # which write_still cannot use.
+            scene.render.image_settings.file_format = 'PNG'
+
             # Set output path
             scene.render.filepath = filepath
 
@@ -209,6 +221,131 @@ class SceneSerializer:
                 'success': False,
                 'error': str(e)
             }
+
+    def render_animation(
+        self,
+        filepath: Optional[str] = None,
+        frame_start: Optional[int] = None,
+        frame_end: Optional[int] = None,
+        fps: Optional[int] = None,
+        engine: Optional[str] = None,
+        samples: Optional[int] = None,
+        resolution_x: Optional[int] = None,
+        resolution_y: Optional[int] = None,
+        container: str = 'MP4'
+    ) -> Dict[str, Any]:
+        """
+        Render the animation frame range to an MP4 video or PNG sequence.
+
+        Args:
+            filepath: Output .mp4 path (MP4) or output directory (PNG)
+            frame_start: First frame (default: scene frame_start)
+            frame_end: Last frame (default: scene frame_end)
+            fps: Frames per second (default: scene fps)
+            engine: Render engine ('CYCLES', 'BLENDER_EEVEE_NEXT', ...)
+            samples: Sample count for the chosen engine
+            resolution_x: Output width in pixels
+            resolution_y: Output height in pixels
+            container: 'MP4' (H.264 video) or 'PNG' (image sequence)
+
+        Returns:
+            Dict with filepath, frame_count, resolution and render time
+        """
+        import time
+
+        scene = bpy.context.scene
+        container = container.upper()
+        if container not in ('MP4', 'PNG'):
+            return {'success': False, 'error': "container must be 'MP4' or 'PNG'"}
+
+        orig_range = (scene.frame_start, scene.frame_end)
+        start = int(frame_start) if frame_start is not None else scene.frame_start
+        end = int(frame_end) if frame_end is not None else scene.frame_end
+        if end < start:
+            return {'success': False, 'error': f'frame_end {end} < frame_start {start}'}
+        frame_count = end - start + 1
+        if frame_count > 1000:
+            return {
+                'success': False,
+                'error': f'{frame_count} frames requested; capped at 1000. '
+                         'Render a smaller range (or lower fps).'
+            }
+
+        try:
+            scene.frame_start = start
+            scene.frame_end = end
+            if fps:
+                scene.render.fps = int(fps)
+            if engine:
+                scene.render.engine = engine
+            if samples:
+                if scene.render.engine == 'CYCLES':
+                    scene.cycles.samples = int(samples)
+                elif scene.render.engine.startswith('BLENDER_EEVEE'):
+                    scene.eevee.taa_render_samples = int(samples)
+            if resolution_x:
+                scene.render.resolution_x = int(resolution_x)
+            if resolution_y:
+                scene.render.resolution_y = int(resolution_y)
+            if resolution_x or resolution_y:
+                scene.render.resolution_percentage = 100
+
+            if container == 'MP4':
+                if filepath is None:
+                    filepath = os.path.join(tempfile.gettempdir(), 'blender_animation.mp4')
+                filepath = os.path.abspath(os.path.expanduser(filepath))
+                stem = filepath[:-4] if filepath.lower().endswith('.mp4') else filepath
+
+                scene.render.image_settings.file_format = 'FFMPEG'
+                scene.render.ffmpeg.format = 'MPEG4'
+                scene.render.ffmpeg.codec = 'H264'
+                scene.render.ffmpeg.constant_rate_factor = 'HIGH'
+                scene.render.ffmpeg.audio_codec = 'NONE'
+                # Blender appends the frame range to the stem for video output.
+                scene.render.filepath = stem
+                expected = f'{stem}{start:04d}-{end:04d}.mp4'
+            else:
+                if filepath is None:
+                    filepath = os.path.join(tempfile.gettempdir(), 'blender_animation_frames')
+                filepath = os.path.abspath(os.path.expanduser(filepath))
+                os.makedirs(filepath, exist_ok=True)
+                scene.render.image_settings.file_format = 'PNG'
+                scene.render.filepath = os.path.join(filepath, 'frame_####')
+                expected = filepath
+
+            started = time.monotonic()
+            bpy.ops.render.render(animation=True)
+            elapsed = time.monotonic() - started
+
+            final_path = expected
+            if container == 'MP4':
+                if os.path.isfile(expected) and expected != f'{stem}.mp4':
+                    final_path = f'{stem}.mp4'
+                    os.replace(expected, final_path)
+                elif not os.path.isfile(expected):
+                    return {
+                        'success': False,
+                        'error': f'Animation render finished but no file at {expected}'
+                    }
+
+            return {
+                'success': True,
+                'filepath': final_path,
+                'container': container,
+                'frame_start': start,
+                'frame_end': end,
+                'frame_count': frame_count,
+                'fps': scene.render.fps,
+                'engine': scene.render.engine,
+                'resolution': [scene.render.resolution_x, scene.render.resolution_y],
+                'render_time_seconds': round(elapsed, 1),
+            }
+
+        except Exception as e:
+            return {'success': False, 'error': f'{type(e).__name__}: {e}'}
+        finally:
+            # The frame range override is per-call; don't leak it into the scene.
+            scene.frame_start, scene.frame_end = orig_range
 
     def _get_objects_list(self, scene, detail_level: str) -> List[Dict]:
         """Get list of objects in the scene."""

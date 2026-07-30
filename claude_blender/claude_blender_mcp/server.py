@@ -12,9 +12,10 @@ Requires mcp>=2.0.0 (MCP protocol revision 2026-07-28).
 
 import json
 import os
+import tempfile
 from typing import Optional
 
-from typing_extensions import NotRequired, TypedDict
+from typing_extensions import TypedDict
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ResourceError, ToolError
@@ -35,15 +36,32 @@ mcp = MCPServer(
     ),
     instructions=(
         "Tools for driving a live Blender instance over a local socket.\n"
-        "- Call blender_ping first if a tool reports a connection problem.\n"
-        "- Use blender_get_scene / blender_get_object (or the blender://scene "
-        "resource) to inspect state before modifying it.\n"
-        "- blender_execute runs arbitrary bpy Python for anything not covered by "
-        "a dedicated tool.\n"
-        "- blender_screenshot and blender_render return the actual image so you "
-        "can verify results visually and iterate."
+        "\n"
+        "Recommended working loop:\n"
+        "1. INSPECT before acting: blender_get_scene / blender_get_object (or the "
+        "blender://scene resource). Never assume object names or positions.\n"
+        "2. CHECKPOINT before risky changes: call blender_checkpoint before "
+        "destructive edits or blender_execute, then blender_undo if the result "
+        "is wrong. This makes aggressive experimentation cheap.\n"
+        "3. ACT with dedicated tools first (add/modify/delete, materials, "
+        "modifiers, duplicate, organize, import/export, frame_camera). Reserve "
+        "blender_execute for what no dedicated tool covers.\n"
+        "4. VERIFY visually: blender_screenshot is fast (GUI only); "
+        "blender_render shows the truth. Look at the returned image and "
+        "critique framing, lighting, and materials before declaring success.\n"
+        "5. ITERATE cheap, FINISH expensive: draft renders at 640x360 with "
+        "BLENDER_EEVEE_NEXT or CYCLES at <=32 samples; only the final render "
+        "deserves full resolution and high samples.\n"
+        "\n"
+        "Tips:\n"
+        "- blender_frame_camera aims the camera at any object(s) with correct "
+        "fit math; use it instead of hand-computing camera transforms.\n"
+        "- blender_render_animation returns preview stills from the video so "
+        "you can judge motion without watching the file.\n"
+        "- If a tool reports a connection problem, call blender_ping and tell "
+        "the user to start the server from Blender's Claude sidebar tab."
     ),
-    version="0.2.0",
+    version="0.3.0",
     cache_hints={
         "tools/list": _LIST_CACHE,
         "prompts/list": _LIST_CACHE,
@@ -58,9 +76,15 @@ _DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open
 _CAPTURE = ToolAnnotations(
     read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False
 )
+_IDEMPOTENT_WRITE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False
+)
 
 # Images above this size are referenced by path instead of inlined into the result.
 _MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024
+
+# Path of the most recent render/screenshot, served by blender://render/latest.
+_LAST_RENDER = {"path": None}
 
 
 def get_blender() -> BlenderClient:
@@ -111,15 +135,37 @@ class SceneInfo(TypedDict):
     objects: list[SceneObjectInfo]
 
 
+class ModifierInfo(TypedDict):
+    name: str
+    type: str
+
+
 class ObjectInfo(TypedDict):
+    # All keys are always emitted: the SDK serializes omitted NotRequired
+    # keys as null, which would then violate this very schema.
     name: str
     type: str
     location: list[float]
     rotation: list[float]
     scale: list[float]
     visible: bool
-    dimensions: NotRequired[list[float]]
-    materials: NotRequired[list[str]]
+    dimensions: list[float]
+    materials: list[str]
+    modifiers: list[ModifierInfo]
+    collections: list[str]
+    vertex_count: Optional[int]
+    polygon_count: Optional[int]
+
+
+class ImportResult(TypedDict):
+    filepath: str
+    format: str
+    objects_added: list[str]
+
+
+class DuplicateResult(TypedDict):
+    source: str
+    created: list[str]
 
 
 # =============================================================================
@@ -213,6 +259,7 @@ async def blender_get_object(name: str) -> ObjectInfo:
     if "error" in result:
         raise ToolError(str(result["error"]))
 
+    mesh = result.get("mesh") if isinstance(result.get("mesh"), dict) else {}
     info: ObjectInfo = {
         "name": result.get("name", name),
         "type": result.get("type", "UNKNOWN"),
@@ -220,11 +267,17 @@ async def blender_get_object(name: str) -> ObjectInfo:
         "rotation": [float(v) for v in result.get("rotation", [0, 0, 0])],
         "scale": [float(v) for v in result.get("scale", [1, 1, 1])],
         "visible": bool(result.get("visible", True)),
+        "dimensions": [float(v) for v in result.get("dimensions", [0, 0, 0])],
+        "materials": [str(m) for m in result.get("materials") or []],
+        "modifiers": [
+            {"name": str(m.get("name")), "type": str(m.get("type"))}
+            for m in result.get("modifiers") or []
+            if isinstance(m, dict)
+        ],
+        "collections": [str(c) for c in result.get("collections") or []],
+        "vertex_count": int(mesh["vertex_count"]) if "vertex_count" in mesh else None,
+        "polygon_count": int(mesh["polygon_count"]) if "polygon_count" in mesh else None,
     }
-    if "dimensions" in result:
-        info["dimensions"] = [float(v) for v in result["dimensions"]]
-    if result.get("materials"):
-        info["materials"] = [str(m) for m in result["materials"]]
     return info
 
 
@@ -416,6 +469,7 @@ async def blender_screenshot(
     if not path or not os.path.exists(path):
         raise ToolError(f"Screenshot reported success but file not found: {path}")
 
+    _LAST_RENDER["path"] = path
     return _preview(f"Screenshot saved to: {path}", path)
 
 
@@ -459,7 +513,256 @@ async def blender_render(
     if not path or not os.path.exists(path):
         raise ToolError(f"Render reported success but file not found: {path}")
 
+    _LAST_RENDER["path"] = path
     return _preview(f"Render saved to: {path}", path)
+
+
+@mcp.tool(annotations=_CAPTURE, structured_output=False)
+async def blender_render_animation(
+    filepath: Optional[str] = None,
+    frame_start: Optional[int] = None,
+    frame_end: Optional[int] = None,
+    fps: Optional[int] = None,
+    engine: str = "BLENDER_EEVEE_NEXT",
+    samples: int = 64,
+    resolution_x: int = 1280,
+    resolution_y: int = 720,
+    container: str = "MP4",
+    preview_frames: int = 3,
+    timeout_seconds: int = 1800,
+):
+    """
+    Render the animation to an MP4 video (or PNG sequence) and return preview
+    stills so you can judge the motion without opening the file.
+
+    Rendering blocks until every frame is done; budget roughly
+    (seconds per frame) x (frame count). Draft with EEVEE at low resolution
+    before committing to a long Cycles animation.
+
+    Args:
+        filepath: Output .mp4 path (MP4) or directory (PNG); default temp file
+        frame_start: First frame (default: scene frame range)
+        frame_end: Last frame (default: scene frame range)
+        fps: Frames per second (default: scene fps)
+        engine: Render engine - 'BLENDER_EEVEE_NEXT' (fast) or 'CYCLES' (quality)
+        samples: Render samples per frame
+        resolution_x: Output width in pixels
+        resolution_y: Output height in pixels
+        container: 'MP4' for H.264 video, 'PNG' for an image sequence
+        preview_frames: How many evenly spaced preview stills to return (0-5)
+        timeout_seconds: How long to wait for the full render (60-7200)
+
+    Returns:
+        Video/sequence path, render stats, and inline preview images
+    """
+    client = get_blender()
+    timeout = float(min(max(timeout_seconds, 60), 7200))
+
+    kwargs = {
+        "engine": engine,
+        "samples": int(samples),
+        "resolution_x": int(resolution_x),
+        "resolution_y": int(resolution_y),
+        "container": container,
+    }
+    if filepath:
+        kwargs["filepath"] = filepath
+    if frame_start is not None:
+        kwargs["frame_start"] = int(frame_start)
+    if frame_end is not None:
+        kwargs["frame_end"] = int(frame_end)
+    if fps is not None:
+        kwargs["fps"] = int(fps)
+
+    result = _unwrap(await client.call("render_animation", timeout=timeout, **kwargs))
+    _require_success(result, "Animation render")
+
+    out_path = result.get("filepath")
+    start = int(result.get("frame_start", 1))
+    end = int(result.get("frame_end", start))
+    content: list = [
+        f"Animation rendered to: {out_path}\n"
+        f"{result.get('frame_count')} frames @ {result.get('fps')} fps, "
+        f"{'x'.join(str(v) for v in result.get('resolution', []))}, "
+        f"{result.get('engine')}, {result.get('render_time_seconds')}s"
+    ]
+
+    n_previews = min(max(int(preview_frames), 0), 5, end - start + 1)
+    if n_previews:
+        if n_previews == 1:
+            frames = [(start + end) // 2]
+        else:
+            span = end - start
+            frames = sorted({start + round(span * i / (n_previews - 1)) for i in range(n_previews)})
+
+        for frame in frames:
+            try:
+                if result.get("container") == "PNG":
+                    # Frames are already on disk as frame_0001.png etc.
+                    still = os.path.join(out_path, f"frame_{frame:04d}.png")
+                else:
+                    still = os.path.join(
+                        tempfile.gettempdir(), f"claude_anim_preview_{frame:04d}.png"
+                    )
+                    await client.execute(f"import bpy\nbpy.context.scene.frame_set({int(frame)})")
+                    preview = _unwrap(await client.render(
+                        filepath=still,
+                        engine=engine,
+                        samples=min(int(samples), 16),
+                        resolution_x=int(resolution_x),
+                        resolution_y=int(resolution_y),
+                        timeout=300.0,
+                    ))
+                    if not preview.get("success"):
+                        continue
+                if os.path.exists(still) and os.path.getsize(still) <= _MAX_INLINE_IMAGE_BYTES:
+                    content.append(f"Frame {frame}:")
+                    content.append(Image(path=still))
+                    _LAST_RENDER["path"] = still
+            except Exception:
+                continue  # Previews are best-effort; the video itself succeeded.
+
+        if len(content) == 1:
+            content[0] += "\n(preview stills could not be generated)"
+
+    return content
+
+
+# =============================================================================
+# Camera Tools
+# =============================================================================
+
+
+@mcp.tool(annotations=_IDEMPOTENT_WRITE)
+async def blender_frame_camera(
+    targets: Optional[list] = None,
+    camera: Optional[str] = None,
+    azimuth_deg: float = 45.0,
+    elevation_deg: float = 20.0,
+    margin: float = 1.15,
+    distance: Optional[float] = None,
+    lens: Optional[float] = None,
+) -> str:
+    """
+    Position and aim a camera so the target objects fill the frame.
+
+    Handles all the vector math: bounding-sphere fit, orbit angles, look-at
+    rotation, and clip range. Creates a camera if the scene has none, and
+    makes it the active scene camera.
+
+    Args:
+        targets: Object names to frame (default: all visible geometry)
+        camera: Camera object name (default: scene camera)
+        azimuth_deg: Horizontal orbit angle in degrees (0 = looking from +X)
+        elevation_deg: Vertical angle in degrees above the subject
+        margin: Framing margin; 1.0 = subject touches the frame edges
+        distance: Explicit camera distance, overriding the automatic fit
+        lens: Focal length in mm to set before fitting (e.g. 85 for portraits)
+
+    Returns:
+        Camera name, distance, and framed targets
+    """
+    client = get_blender()
+
+    kwargs = {
+        "azimuth_deg": float(azimuth_deg),
+        "elevation_deg": float(elevation_deg),
+        "margin": float(margin),
+    }
+    if targets:
+        kwargs["targets"] = [str(t) for t in targets]
+    if camera:
+        kwargs["camera"] = camera
+    if distance is not None:
+        kwargs["distance"] = float(distance)
+    if lens is not None:
+        kwargs["lens"] = float(lens)
+
+    result = _unwrap(await client.call("frame_camera", **kwargs))
+    _require_success(result, "Camera framing")
+
+    framed = ", ".join(result.get("targets", []))
+    return (
+        f"Camera '{result.get('camera')}' framed [{framed}] from "
+        f"{result.get('distance'):.2f}m (azimuth {azimuth_deg} deg, elevation {elevation_deg} deg). "
+        "Take a blender_screenshot or a draft blender_render to verify the framing."
+    )
+
+
+# =============================================================================
+# Import / Export Tools
+# =============================================================================
+
+
+@mcp.tool(annotations=_ADDITIVE)
+async def blender_import_model(filepath: str, format: Optional[str] = None) -> ImportResult:
+    """
+    Import a 3D model file into the scene.
+
+    Supported formats: obj, stl, ply, fbx, gltf, glb, usd/usda/usdc/usdz,
+    dae (Collada), abc (Alembic). Format is inferred from the extension.
+
+    Args:
+        filepath: Path to the model file on this machine
+        format: Optional explicit format when the extension is misleading
+
+    Returns:
+        The names of the objects added to the scene
+    """
+    expanded = os.path.abspath(os.path.expanduser(filepath))
+    if not os.path.isfile(expanded):
+        raise ToolError(f"File not found: {expanded}")
+
+    client = get_blender()
+    kwargs = {"filepath": expanded}
+    if format:
+        kwargs["format"] = format
+
+    result = _unwrap(await client.call("import_model", timeout=300.0, **kwargs))
+    _require_success(result, "Import")
+
+    return {
+        "filepath": result.get("filepath", expanded),
+        "format": str(result.get("format", "")),
+        "objects_added": [str(n) for n in result.get("objects_added", [])],
+    }
+
+
+@mcp.tool(annotations=_CAPTURE)
+async def blender_export(
+    filepath: str,
+    format: Optional[str] = None,
+    objects: Optional[list] = None,
+) -> str:
+    """
+    Export the scene (or specific objects) to a 3D model file.
+
+    Supported formats: obj, stl (3D printing), ply, fbx, gltf, glb (web/AR),
+    usd/usda/usdc, dae, abc. Format comes from the file extension.
+
+    Args:
+        filepath: Output path; the extension selects the format (e.g. part.stl)
+        format: Optional explicit format overriding the extension
+        objects: Object names to export (whole scene when omitted)
+
+    Returns:
+        Export confirmation with path, object count and file size
+    """
+    client = get_blender()
+    kwargs = {"filepath": os.path.abspath(os.path.expanduser(filepath))}
+    if format:
+        kwargs["format"] = format
+    if objects:
+        kwargs["objects"] = [str(o) for o in objects]
+
+    result = _unwrap(await client.call("export_model", timeout=300.0, **kwargs))
+    _require_success(result, "Export")
+
+    size_kb = result.get("file_size", 0) / 1024
+    return (
+        f"Exported {result.get('object_count')} object(s) to "
+        f"{result.get('filepath')} ({result.get('format')}, {size_kb:.1f} KB)"
+    )
 
 
 # =============================================================================
@@ -630,6 +933,214 @@ __result__ = "Frame range set to {start} - {end}"
     if result.get("error"):
         raise ToolError(f"Setting frame range failed: {result['error']}")
     return result.get("result", "Frame range set")
+
+
+# =============================================================================
+# Modifier & Object Organization Tools
+# =============================================================================
+
+_MODIFIER_ACTIONS = ("add", "apply", "remove")
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+async def blender_modifier(
+    action: str,
+    object_name: str,
+    modifier_type: Optional[str] = None,
+    modifier_name: Optional[str] = None,
+    params: Optional[dict] = None,
+) -> str:
+    """
+    Add, apply, or remove a modifier on an object.
+
+    Modifiers are Blender's non-destructive editing stack: SUBSURF (smooth),
+    BOOLEAN (cut/join), ARRAY (repeat), MIRROR, SOLIDIFY, BEVEL, DECIMATE,
+    DISPLACE, WIREFRAME, and more.
+
+    Args:
+        action: 'add' (needs modifier_type), 'apply' or 'remove' (need modifier_name).
+                'apply' bakes the modifier into the mesh permanently.
+        object_name: Object to operate on
+        modifier_type: Blender modifier type for 'add', e.g. 'SUBSURF', 'BOOLEAN'
+        modifier_name: Modifier name for 'apply'/'remove' (see blender_get_object)
+        params: Attribute values for 'add', e.g. {"levels": 2} for SUBSURF or
+                {"operation": "DIFFERENCE", "object": "Cutter"} for BOOLEAN
+                (object names are resolved automatically)
+
+    Returns:
+        Result message; for 'add', includes any parameters that failed to apply
+    """
+    if action not in _MODIFIER_ACTIONS:
+        raise ToolError(f"action must be one of {_MODIFIER_ACTIONS}")
+
+    client = get_blender()
+
+    if action == "add":
+        if not modifier_type:
+            raise ToolError("action 'add' requires modifier_type")
+        result = _unwrap(await client.call(
+            "add_modifier",
+            object_name=object_name,
+            modifier_type=modifier_type,
+            params=params or {},
+        ))
+        _require_success(result, "Adding modifier")
+        message = (
+            f"Added {result.get('type')} modifier '{result.get('modifier')}' "
+            f"to '{result.get('object')}'"
+        )
+        if result.get("params_failed"):
+            message += f"\nWARNING - parameters not applied: {result['params_failed']}"
+        return message
+
+    if not modifier_name:
+        raise ToolError(f"action '{action}' requires modifier_name")
+    method = "apply_modifier" if action == "apply" else "remove_modifier"
+    result = _unwrap(await client.call(
+        method, object_name=object_name, modifier_name=modifier_name
+    ))
+    _require_success(result, f"Modifier {action}")
+    verb = "Applied (baked)" if action == "apply" else "Removed"
+    return f"{verb} modifier '{modifier_name}' on '{object_name}'"
+
+
+@mcp.tool(annotations=_ADDITIVE)
+async def blender_duplicate(
+    name: str,
+    count: int = 1,
+    offset: Optional[list] = None,
+    linked: bool = False,
+) -> DuplicateResult:
+    """
+    Duplicate an object N times with a cumulative offset - a one-call linear
+    array (fences, dominoes, columns, stairs).
+
+    Args:
+        name: Source object name
+        count: Number of copies (1-100)
+        offset: Per-copy offset [x, y, z]; copy i sits at source + offset * i
+        linked: Share mesh data with the source (lighter, edits affect all)
+
+    Returns:
+        Names of the created objects
+    """
+    client = get_blender()
+    result = _unwrap(await client.call(
+        "duplicate_object",
+        name=name,
+        count=int(count),
+        offset=[float(v) for v in (offset or [0, 0, 0])],
+        linked=bool(linked),
+    ))
+    _require_success(result, "Duplication")
+    return {
+        "source": str(result.get("source", name)),
+        "created": [str(n) for n in result.get("created", [])],
+    }
+
+
+_ORGANIZE_ACTIONS = ("parent", "unparent", "move_to_collection")
+
+
+@mcp.tool(annotations=_IDEMPOTENT_WRITE)
+async def blender_organize(
+    action: str,
+    objects: list,
+    parent: Optional[str] = None,
+    collection: Optional[str] = None,
+    keep_transform: bool = True,
+    create: bool = True,
+) -> str:
+    """
+    Organize objects: parenting and collection membership.
+
+    Args:
+        action: 'parent' (needs parent), 'unparent', or 'move_to_collection'
+                (needs collection)
+        objects: Names of the objects to organize
+        parent: Parent object name for action 'parent'
+        collection: Target collection for action 'move_to_collection'
+        keep_transform: Preserve world positions when (un)parenting
+        create: Create the collection if it does not exist
+
+    Returns:
+        Result message
+    """
+    if action not in _ORGANIZE_ACTIONS:
+        raise ToolError(f"action must be one of {_ORGANIZE_ACTIONS}")
+    if not objects:
+        raise ToolError("objects must be a non-empty list of object names")
+
+    client = get_blender()
+    names = [str(o) for o in objects]
+
+    if action == "move_to_collection":
+        if not collection:
+            raise ToolError("action 'move_to_collection' requires collection")
+        result = _unwrap(await client.call(
+            "move_to_collection", names=names, collection_name=collection, create=create
+        ))
+        _require_success(result, "Collection move")
+        return f"Moved {len(result.get('moved', []))} object(s) into collection '{result.get('collection')}'"
+
+    if action == "parent" and not parent:
+        raise ToolError("action 'parent' requires parent")
+    result = _unwrap(await client.call(
+        "set_parent",
+        child_names=names,
+        parent_name=parent if action == "parent" else None,
+        keep_transform=keep_transform,
+    ))
+    _require_success(result, "Parenting")
+    if action == "parent":
+        return f"Parented {len(result.get('changed', []))} object(s) to '{parent}'"
+    return f"Cleared parent on {len(result.get('changed', []))} object(s)"
+
+
+# =============================================================================
+# Undo / Checkpoint Tools
+# =============================================================================
+
+
+@mcp.tool(annotations=_ADDITIVE)
+async def blender_checkpoint(label: str = "Claude checkpoint") -> str:
+    """
+    Push an undo checkpoint. Call this BEFORE destructive edits or
+    blender_execute so a bad result can be rolled back with blender_undo.
+
+    Args:
+        label: Name shown in Blender's undo history
+
+    Returns:
+        Confirmation message
+    """
+    client = get_blender()
+    result = _unwrap(await client.call("checkpoint", label=label))
+    _require_success(result, "Checkpoint")
+    return f"Checkpoint '{label}' pushed. Roll back with blender_undo if needed."
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+async def blender_undo(steps: int = 1, redo: bool = False) -> str:
+    """
+    Undo (or redo) recent changes in Blender.
+
+    Args:
+        steps: How many undo steps to take (1-50)
+        redo: Redo instead of undo
+
+    Returns:
+        How many steps were actually performed
+    """
+    client = get_blender()
+    method = "redo" if redo else "undo"
+    result = _unwrap(await client.call(method, steps=int(steps)))
+    _require_success(result, "Undo" if not redo else "Redo")
+    performed = result.get("steps_performed", 0)
+    return (
+        f"{'Redid' if redo else 'Undid'} {performed} step(s). "
+        "Verify the scene state with blender_get_scene."
+    )
 
 
 # =============================================================================
@@ -1003,6 +1514,43 @@ async def scene_resource() -> str:
     if "error" in response:
         raise ResourceError(response["error"].get("message", "Blender not reachable"))
     return json.dumps(response.get("result", {}), indent=2, default=str)
+
+
+@mcp.resource(
+    "blender://object/{name}",
+    title="Blender Object",
+    description="Full details of a single object: transform, mesh stats, "
+                "materials, modifiers, collections.",
+    mime_type="application/json",
+)
+async def object_resource(name: str) -> str:
+    """Single-object state as JSON."""
+    client = get_blender()
+    response = await client.get_object(name)
+    if "error" in response:
+        raise ResourceError(response["error"].get("message", "Blender not reachable"))
+    result = response.get("result", {})
+    if isinstance(result, dict) and result.get("error"):
+        raise ResourceError(str(result["error"]))
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.resource(
+    "blender://render/latest",
+    title="Latest Render",
+    description="The most recent render or screenshot from this session, as PNG.",
+    mime_type="image/png",
+)
+async def latest_render_resource() -> bytes:
+    """Raw PNG bytes of the last image this server produced."""
+    path = _LAST_RENDER["path"]
+    if not path or not os.path.exists(path):
+        raise ResourceError(
+            "No render yet in this session. Call blender_render or "
+            "blender_screenshot first."
+        )
+    with open(path, "rb") as f:
+        return f.read()
 
 
 # =============================================================================

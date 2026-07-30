@@ -220,12 +220,12 @@ class CommandExecutor:
             }
             kwargs['type'] = light_types.get(object_type.lower(), 'POINT')
 
-        # Execute operator
+        # Execute operator (scale is applied post-creation: primitive_*_add
+        # operators silently ignore their scale argument in object mode)
         result = self.execute_operator(
             operator,
             location=location,
             rotation=rotation,
-            scale=scale,
             **kwargs
         )
 
@@ -236,10 +236,12 @@ class CommandExecutor:
                 'error': result['error']
             }
 
-        # Get created object and rename if needed
+        # Get created object, rename and scale if needed
         obj = bpy.context.active_object
         if obj and name:
             obj.name = name
+        if obj and tuple(scale) != (1, 1, 1):
+            obj.scale = scale
 
         return {
             'success': True,
@@ -324,6 +326,257 @@ class CommandExecutor:
                 'success': False,
                 'error': f"{type(e).__name__}: {str(e)}"
             }
+
+    def add_modifier(
+        self,
+        object_name: str,
+        modifier_type: str,
+        params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Add a modifier to an object and configure its parameters.
+
+        Args:
+            object_name: Object to add the modifier to
+            modifier_type: Blender modifier type (e.g. 'SUBSURF', 'BOOLEAN',
+                           'ARRAY', 'MIRROR', 'SOLIDIFY', 'BEVEL')
+            params: Modifier attribute values; string values for attributes
+                    that expect an object (e.g. boolean 'object') are resolved
+                    by object name
+
+        Returns:
+            Dict with the created modifier name plus per-param results
+        """
+        obj = bpy.data.objects.get(object_name)
+        if not obj:
+            return {'success': False, 'error': f'Object not found: {object_name}'}
+        if not hasattr(obj, 'modifiers'):
+            return {'success': False, 'error': f'Object type {obj.type} has no modifiers'}
+
+        modifier_type = modifier_type.upper()
+        try:
+            mod = obj.modifiers.new(name=modifier_type.title(), type=modifier_type)
+        except (TypeError, RuntimeError) as e:
+            return {'success': False, 'error': f'Invalid modifier type {modifier_type}: {e}'}
+        if mod is None:
+            return {'success': False, 'error': f'Modifier type {modifier_type} rejected for {obj.type}'}
+
+        params_set, params_failed = [], {}
+        for key, value in (params or {}).items():
+            try:
+                setattr(mod, key, value)
+                params_set.append(key)
+            except (TypeError, AttributeError) as e:
+                # Attributes expecting a datablock get a name string from JSON.
+                target = bpy.data.objects.get(value) if isinstance(value, str) else None
+                if target is not None:
+                    try:
+                        setattr(mod, key, target)
+                        params_set.append(key)
+                        continue
+                    except Exception as e2:
+                        e = e2
+                params_failed[key] = str(e)
+
+        result = {
+            'success': True,
+            'object': obj.name,
+            'modifier': mod.name,
+            'type': mod.type,
+            'params_set': params_set,
+        }
+        if params_failed:
+            result['params_failed'] = params_failed
+        return result
+
+    def apply_modifier(self, object_name: str, modifier_name: str) -> Dict[str, Any]:
+        """Apply (bake) a modifier into the object's mesh data."""
+        obj = bpy.data.objects.get(object_name)
+        if not obj:
+            return {'success': False, 'error': f'Object not found: {object_name}'}
+        if modifier_name not in obj.modifiers:
+            return {'success': False, 'error': f'Modifier not found on {object_name}: {modifier_name}'}
+
+        try:
+            with bpy.context.temp_override(
+                object=obj, active_object=obj, selected_objects=[obj]
+            ):
+                bpy.ops.object.modifier_apply(modifier=modifier_name)
+            return {'success': True, 'object': obj.name, 'applied': modifier_name}
+        except Exception as e:
+            return {'success': False, 'error': f'{type(e).__name__}: {e}'}
+
+    def remove_modifier(self, object_name: str, modifier_name: str) -> Dict[str, Any]:
+        """Remove a modifier without applying it."""
+        obj = bpy.data.objects.get(object_name)
+        if not obj:
+            return {'success': False, 'error': f'Object not found: {object_name}'}
+        mod = obj.modifiers.get(modifier_name)
+        if not mod:
+            return {'success': False, 'error': f'Modifier not found on {object_name}: {modifier_name}'}
+        obj.modifiers.remove(mod)
+        return {'success': True, 'object': obj.name, 'removed': modifier_name}
+
+    def duplicate_object(
+        self,
+        name: str,
+        count: int = 1,
+        offset: Tuple[float, float, float] = (0, 0, 0),
+        linked: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Duplicate an object N times with a cumulative offset (linear array).
+
+        Args:
+            name: Source object name
+            count: Number of copies (1-100)
+            offset: Per-copy location offset [x, y, z]
+            linked: Share mesh data with the source (instances) instead of copying
+
+        Returns:
+            Dict with the names of the created objects
+        """
+        from mathutils import Vector
+
+        src = bpy.data.objects.get(name)
+        if not src:
+            return {'success': False, 'error': f'Object not found: {name}'}
+
+        count = int(count)
+        if not 1 <= count <= 100:
+            return {'success': False, 'error': 'count must be between 1 and 100'}
+
+        collection = src.users_collection[0] if src.users_collection \
+            else bpy.context.scene.collection
+        step = Vector(offset)
+        created = []
+        try:
+            for i in range(1, count + 1):
+                dup = src.copy()
+                if src.data and not linked:
+                    dup.data = src.data.copy()
+                dup.location = src.location + step * i
+                collection.objects.link(dup)
+                created.append(dup.name)
+        except Exception as e:
+            return {'success': False, 'error': f'{type(e).__name__}: {e}', 'created': created}
+
+        return {'success': True, 'source': src.name, 'created': created}
+
+    def set_parent(
+        self,
+        child_names: list,
+        parent_name: Optional[str] = None,
+        keep_transform: bool = True
+    ) -> Dict[str, Any]:
+        """Parent objects to a target (or clear parents when parent_name is None)."""
+        parent = None
+        if parent_name is not None:
+            parent = bpy.data.objects.get(parent_name)
+            if not parent:
+                return {'success': False, 'error': f'Parent not found: {parent_name}'}
+
+        changed, missing = [], []
+        for child_name in child_names:
+            child = bpy.data.objects.get(child_name)
+            if not child:
+                missing.append(child_name)
+                continue
+            if parent is not None:
+                child.parent = parent
+                if keep_transform:
+                    child.matrix_parent_inverse = parent.matrix_world.inverted()
+            else:
+                if keep_transform:
+                    world = child.matrix_world.copy()
+                    child.parent = None
+                    child.matrix_world = world
+                else:
+                    child.parent = None
+            changed.append(child_name)
+
+        if missing:
+            return {'success': False, 'error': f'Objects not found: {", ".join(missing)}',
+                    'changed': changed}
+        return {'success': True, 'parent': parent_name, 'changed': changed}
+
+    def move_to_collection(
+        self,
+        names: list,
+        collection_name: str,
+        create: bool = True
+    ) -> Dict[str, Any]:
+        """Move objects into a collection, creating and linking it if needed."""
+        coll = bpy.data.collections.get(collection_name)
+        if coll is None:
+            if not create:
+                return {'success': False, 'error': f'Collection not found: {collection_name}'}
+            coll = bpy.data.collections.new(collection_name)
+            bpy.context.scene.collection.children.link(coll)
+
+        moved, missing = [], []
+        for name in names:
+            obj = bpy.data.objects.get(name)
+            if not obj:
+                missing.append(name)
+                continue
+            for old in list(obj.users_collection):
+                old.objects.unlink(obj)
+            coll.objects.link(obj)
+            moved.append(name)
+
+        if missing:
+            return {'success': False, 'error': f'Objects not found: {", ".join(missing)}',
+                    'moved': moved}
+        return {'success': True, 'collection': coll.name, 'moved': moved}
+
+    def _undo_override(self):
+        """Context override with a window, required by undo ops in timers."""
+        wm = bpy.context.window_manager
+        if wm and wm.windows:
+            win = wm.windows[0]
+            return bpy.context.temp_override(window=win, screen=win.screen)
+        from contextlib import nullcontext
+        return nullcontext()
+
+    def checkpoint(self, label: str = 'Claude checkpoint') -> Dict[str, Any]:
+        """Push an undo checkpoint so later changes can be rolled back."""
+        if bpy.app.background:
+            return {'success': False,
+                    'error': 'Undo stack is disabled in background (headless) mode'}
+        try:
+            with self._undo_override():
+                bpy.ops.ed.undo_push(message=str(label))
+            return {'success': True, 'label': str(label)}
+        except Exception as e:
+            return {'success': False, 'error': f'{type(e).__name__}: {e}'}
+
+    def undo(self, steps: int = 1) -> Dict[str, Any]:
+        """Undo the last N steps."""
+        return self._undo_redo('undo', steps)
+
+    def redo(self, steps: int = 1) -> Dict[str, Any]:
+        """Redo the last N undone steps."""
+        return self._undo_redo('redo', steps)
+
+    def _undo_redo(self, direction: str, steps: int) -> Dict[str, Any]:
+        if bpy.app.background:
+            return {'success': False,
+                    'error': 'Undo stack is disabled in background (headless) mode'}
+        steps = max(1, min(int(steps), 50))
+        op = bpy.ops.ed.undo if direction == 'undo' else bpy.ops.ed.redo
+        performed = 0
+        try:
+            with self._undo_override():
+                for _ in range(steps):
+                    if 'FINISHED' not in op():
+                        break
+                    performed += 1
+        except Exception as e:
+            if performed == 0:
+                return {'success': False, 'error': f'{type(e).__name__}: {e}'}
+        return {'success': True, 'direction': direction,
+                'steps_requested': steps, 'steps_performed': performed}
 
     def _serialize_result(self, value: Any) -> Any:
         """Serialize a Python value for JSON."""
