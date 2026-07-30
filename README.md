@@ -86,6 +86,7 @@ ln -s /path/to/claude-blender/claude_blender/blender_addon \
 The link **must** be named `claude_blender` — that name becomes the addon's
 Python module name, which the headless script and the AI tools rely on.
 Then enable "Claude Blender" in **Edit > Preferences > Add-ons**.
+You can also ask claude/codex to configure this.
 
 **Option B: Install from zip**
 
@@ -298,7 +299,7 @@ Working inside this repo, three slash commands encode complete workflows
 /blender-turntable <object> [secs]   # 360° turntable video
 ```
 
-## Local AI Services
+## Local AI Services (in progress/testing)
 
 ### Shap-E (Text-to-3D)
 Requires:
@@ -385,7 +386,3 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues and pull requests.
-
-## Credits
-
-Created with Claude Code by Anthropic.
