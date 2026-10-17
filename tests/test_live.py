@@ -170,3 +170,66 @@ async def test_live_v030_features(tmp_path):
             assert os.path.getsize(mp4) > 0
         finally:
             await _cleanup(client, created)
+
+
+async def test_live_review_and_jobs(tmp_path):
+    """v0.5.0: change reports, snapshots, multi-view sheets, render jobs."""
+    from mcp.client import Client
+    from claude_blender_mcp.server import mcp
+
+    async with Client(mcp) as client:
+        try:
+            snap = (await client.call_tool("blender_snapshot", {})).structured_content
+
+            r = await client.call_tool("blender_execute", {"code": (
+                "import bpy, math\n"
+                "bpy.ops.mesh.primitive_monkey_add(location=(0, 0, 1))\n"
+                "o = bpy.context.active_object\n"
+                "o.name = 'LiveTest_Monkey'\n"
+                "o.rotation_euler = (0, 0, 0)\n"
+                "o.keyframe_insert('rotation_euler', frame=1)\n"
+                "o.rotation_euler = (0, 0, math.pi)\n"
+                "o.keyframe_insert('rotation_euler', frame=8)\n"
+            )})
+            assert not r.is_error, r.content
+            text = r.content[0].text
+            assert "LiveTest_Monkey (MESH)" in text, text
+
+            d = (await client.call_tool(
+                "blender_diff", {"snapshot_id": snap["snapshot_id"]}
+            )).structured_content
+            assert "LiveTest_Monkey" in d["added"], d
+
+            r = await client.call_tool("blender_render_views", {
+                "targets": ["LiveTest_Monkey"], "views": ["front", "right", "top"],
+                "resolution_x": 160, "resolution_y": 120, "samples": 4,
+            })
+            assert not r.is_error and _images(r), r.content
+            # The temporary camera must not linger or replace the scene camera
+            d = (await client.call_tool(
+                "blender_diff", {"snapshot_id": snap["snapshot_id"]}
+            )).structured_content
+            assert not any("_claude" in n for n in d["added"]), d
+            assert "camera" not in d["scene"], d
+
+            out = str(tmp_path / "job.mp4")
+            st = (await client.call_tool("blender_render_job_start", {
+                "frame_start": 1, "frame_end": 8, "frame_step": 2,
+                "resolution_x": 160, "resolution_y": 120, "samples": 4,
+                "filepath": out,
+            })).structured_content
+            r = await client.call_tool("blender_render_job_status", {
+                "job_id": st["job_id"], "wait_seconds": 300,
+            })
+            status = json.loads(r.content[0].text)
+            assert status["status"] == "completed", status
+            assert os.path.getsize(out) > 0
+            assert _images(r), "expected a contact sheet of the finished frames"
+
+            # Rendering frames must leave the playhead where it was
+            d = (await client.call_tool(
+                "blender_diff", {"snapshot_id": snap["snapshot_id"]}
+            )).structured_content
+            assert "frame_current" not in d["scene"], d
+        finally:
+            await _cleanup(client, ["LiveTest_Monkey"])

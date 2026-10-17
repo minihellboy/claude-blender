@@ -278,3 +278,72 @@ def test_fake_get_object_contract(scene_env):
 
     missing = set(fake) - set(real)
     assert not missing, f"fake advertises keys the real addon never sends: {missing}"
+
+
+# =============================================================================
+# render_image(frame=...): renders that frame, restores the playhead
+# =============================================================================
+
+
+def test_render_image_frame_override_restores_playhead(scene_env):
+    scene = scene_env.bpy.context.scene
+    frames_seen = []
+
+    def frame_set(f):
+        frames_seen.append(f)
+        scene.frame_current = f
+
+    scene.frame_set = frame_set
+    scene_env.bpy.ops.handlers["render.render"] = (
+        lambda **kw: frames_seen.append(("render", scene.frame_current)) or {"FINISHED"}
+    )
+
+    result = scene_env.ser.render_image(filepath=str(scene_env.tmp / "f.png"), frame=7)
+
+    assert result["success"], result
+    # Rendered AT frame 7, then frame_set (re-evaluating animation) back to 42
+    assert frames_seen == [7, ("render", 7), 42]
+    assert scene.frame_current == 42
+
+
+# =============================================================================
+# visual_utils view parsing
+# =============================================================================
+
+
+@pytest.fixture
+def visual_mod():
+    import sys
+    import types
+
+    bpy = make_bpy()
+    pkg = types.ModuleType("_fake_core")
+    pkg.__path__ = []
+    sys.modules["_fake_core"] = pkg
+    for name in ("camera_utils", "scene_utils"):
+        sys.modules[f"_fake_core.{name}"] = types.ModuleType(name)
+    sys.modules["_fake_core.scene_utils"].SceneSerializer = object
+    sys.modules["_fake_core.scene_utils"]._render_state = None
+    pkg.camera_utils = sys.modules["_fake_core.camera_utils"]
+    try:
+        yield load_module("visual_utils.py", bpy, name="_fake_core.visual_utils")
+    finally:
+        for k in [k for k in sys.modules if k.startswith("_fake_core")]:
+            del sys.modules[k]
+
+
+def test_resolve_views_presets_and_custom(visual_mod):
+    specs = visual_mod._resolve_views(["FRONT", {"azimuth": 30, "elevation": -10}])
+    assert specs[0] == {"name": "front", "azimuth": -90.0, "elevation": 5.0}
+    assert specs[1] == {"name": "az30_el-10", "azimuth": 30.0, "elevation": -10.0}
+    assert [s["name"] for s in visual_mod._resolve_views(None)] == visual_mod.DEFAULT_VIEWS
+
+
+@pytest.mark.parametrize("bad, msg", [
+    (["sideways"], "Unknown view"),
+    ([42], "Invalid view spec"),
+    (["front"] * 13, "max is 12"),
+])
+def test_resolve_views_rejects_bad_input(visual_mod, bad, msg):
+    with pytest.raises(ValueError, match=msg):
+        visual_mod._resolve_views(bad)

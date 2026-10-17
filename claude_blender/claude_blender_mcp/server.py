@@ -10,19 +10,31 @@ All AI runs locally - no external API calls.
 Requires mcp>=2.0.0 (MCP protocol revision 2026-07-28).
 """
 
+import asyncio
 import json
 import os
 import tempfile
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
+from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
-from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver import (
+    AcceptedElicitation,
+    Context,
+    Elicit,
+    ElicitationResult,
+    Image,
+    MCPServer,
+    Resolve,
+)
 from mcp.server.mcpserver.exceptions import ResourceError, ToolError
 from mcp.server.mcpserver.server import CacheHint
 from mcp.types import ToolAnnotations
 
+from . import snapshots
 from .blender_client import get_client, BlenderClient
+from .render_jobs import ACTIVE, MAX_FRAMES, JobManager, pick_evenly
 
 
 # The tool/prompt surface is static, so clients may cache list results for an hour.
@@ -42,13 +54,17 @@ mcp = MCPServer(
         "blender://scene resource). Never assume object names or positions.\n"
         "2. CHECKPOINT before risky changes: call blender_checkpoint before "
         "destructive edits or blender_execute, then blender_undo if the result "
-        "is wrong. This makes aggressive experimentation cheap.\n"
+        "is wrong. This makes aggressive experimentation cheap. "
+        "blender_snapshot + blender_diff show exactly what changed since any "
+        "point (including edits the user made by hand).\n"
         "3. ACT with dedicated tools first (add/modify/delete, materials, "
         "modifiers, duplicate, organize, import/export, frame_camera). Reserve "
         "blender_execute for what no dedicated tool covers.\n"
         "4. VERIFY visually: blender_screenshot is fast (GUI only); "
-        "blender_render shows the truth. Look at the returned image and "
-        "critique framing, lighting, and materials before declaring success.\n"
+        "blender_render shows the truth; blender_render_views shows the model "
+        "from several angles in ONE image (catches floating or intersecting "
+        "parts a single view hides). Look at the returned image and critique "
+        "framing, lighting, and materials before declaring success.\n"
         "5. ITERATE cheap, FINISH expensive: draft renders at 640x360 with "
         "BLENDER_EEVEE_NEXT or CYCLES at <=32 samples; only the final render "
         "deserves full resolution and high samples.\n"
@@ -58,12 +74,17 @@ mcp = MCPServer(
         "after substantial scene work.\n"
         "- blender_frame_camera aims the camera at any object(s) with correct "
         "fit math; use it instead of hand-computing camera transforms.\n"
-        "- blender_render_animation returns preview stills from the video so "
-        "you can judge motion without watching the file.\n"
+        "- Animations: blender_render_job_start renders in the background and "
+        "returns a job_id; poll blender_render_job_status (wait_seconds "
+        "long-polls) for progress, ETA and frame previews, and "
+        "blender_render_job_cancel to stop. Use frame_step for quick motion "
+        "drafts. blender_render_animation is the blocking alternative.\n"
+        "- blender_execute ends with a diff of what the code changed in the "
+        "scene - read it to confirm the code did what you intended.\n"
         "- If a tool reports a connection problem, call blender_ping and tell "
         "the user to start the server from Blender's Claude sidebar tab."
     ),
-    version="0.4.0",
+    version="0.5.0",
     cache_hints={
         "tools/list": _LIST_CACHE,
         "prompts/list": _LIST_CACHE,
@@ -87,6 +108,10 @@ _MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024
 
 # Path of the most recent render/screenshot, served by blender://render/latest.
 _LAST_RENDER = {"path": None}
+
+# Process-local handles the model passes back (stateless-MCP pattern).
+_SNAPSHOTS = snapshots.SnapshotStore()
+_JOBS = JobManager()
 
 
 def get_blender() -> BlenderClient:
@@ -429,19 +454,29 @@ async def blender_delete_object(name: str) -> str:
 
 
 @mcp.tool(annotations=_DESTRUCTIVE)
-async def blender_execute(code: str, timeout_seconds: int = 120) -> str:
+async def blender_execute(
+    code: str, timeout_seconds: int = 120, report_changes: bool = True
+) -> str:
     """
     Execute Python code in Blender's environment.
 
     This gives you full access to Blender's Python API (bpy).
     Use __result__ variable to return a value.
 
+    With report_changes (default) the result ends with a diff of what the
+    code actually did to the scene - objects added/removed, transforms,
+    materials, modifiers, render settings - so you can verify the effect
+    without a follow-up inspection call. On an error the diff shows what
+    the code changed before it failed.
+
     Args:
         code: Python code to execute. Has access to bpy and all Blender modules.
         timeout_seconds: How long to wait for completion (1-3600, default 120)
+        report_changes: Append a scene diff of the code's effects
 
     Returns:
-        Execution result including any output and the __result__ value if set
+        Execution result including any output, the __result__ value if set,
+        and the scene changes
 
     Example:
         code: '''
@@ -455,6 +490,7 @@ async def blender_execute(code: str, timeout_seconds: int = 120) -> str:
     """
     client = get_blender()
     timeout = float(min(max(timeout_seconds, 1), 3600))
+    before = await _scene_state(client) if report_changes else None
     result = _unwrap(await client.execute(code, timeout=timeout))
 
     lines = []
@@ -463,6 +499,12 @@ async def blender_execute(code: str, timeout_seconds: int = 120) -> str:
 
     if result.get("result") is not None:
         lines.append(f"Result: {result['result']}")
+
+    if before is not None:
+        after = await _scene_state(client)
+        if after is not None:
+            diff = snapshots.diff_states(before, after)
+            lines.append("Scene changes:\n" + snapshots.summarize(diff, after))
 
     if result.get("error"):
         detail = "\n".join(lines)
@@ -476,6 +518,19 @@ async def blender_execute(code: str, timeout_seconds: int = 120) -> str:
         return "Execution completed with no output"
 
     return "\n".join(lines)
+
+
+async def _scene_state(client: BlenderClient) -> Optional[dict]:
+    """The addon's diffable scene fingerprint, or None when unavailable.
+
+    Never raises: an older addon without scene_state (or a scene too large
+    to fingerprint) just means no change report.
+    """
+    try:
+        result = _unwrap(await client.call("scene_state", timeout=60.0))
+    except ToolError:
+        return None
+    return result if result.get("success") else None
 
 
 # =============================================================================
@@ -689,11 +744,462 @@ async def blender_render_animation(
     return content
 
 
+# =============================================================================
+# Visual Review Tools
+# =============================================================================
+
+
+@mcp.tool(annotations=_CAPTURE, structured_output=False)
+async def blender_render_views(
+    targets: Optional[list[str]] = None,
+    views: Optional[list[str | dict]] = None,
+    engine: str = "BLENDER_EEVEE_NEXT",
+    samples: int = 16,
+    resolution_x: int = 480,
+    resolution_y: int = 360,
+    ortho: bool = False,
+    columns: Optional[int] = None,
+    filepath: Optional[str] = None,
+):
+    """
+    Render the subject from several angles and return ONE contact-sheet
+    image - the fastest way to check a model from every side (floating
+    parts, intersections, wrong proportions, missing faces on the back).
+
+    Uses a temporary camera: the scene camera and render settings are
+    untouched. Cells are laid out row-major from the top-left, in the
+    order of `views`.
+
+    Args:
+        targets: Objects to frame (default: all visible geometry)
+        views: Preset names - 'front', 'back', 'left', 'right', 'top',
+               'bottom', 'three_quarter', 'three_quarter_back' - or dicts
+               {"name", "azimuth", "elevation"} in degrees.
+               Default: front, right, top, three_quarter
+        engine: Render engine for every cell (EEVEE is fast)
+        samples: Samples per cell
+        resolution_x: Width of each cell in pixels
+        resolution_y: Height of each cell in pixels
+        ortho: Orthographic projection - true proportions for checking
+               alignment and scale
+        columns: Grid columns (default: square-ish)
+        filepath: Where to save the sheet PNG (default: temp file)
+
+    Returns:
+        The contact sheet image plus its layout
+    """
+    client = get_blender()
+    kwargs = {
+        "engine": engine,
+        "samples": int(samples),
+        "resolution_x": int(resolution_x),
+        "resolution_y": int(resolution_y),
+        "ortho": bool(ortho),
+    }
+    if targets:
+        kwargs["targets"] = [str(t) for t in targets]
+    if views:
+        kwargs["views"] = views
+    if columns:
+        kwargs["columns"] = int(columns)
+    if filepath:
+        kwargs["filepath"] = os.path.abspath(os.path.expanduser(filepath))
+
+    result = _unwrap(await client.call("render_views", timeout=900.0, **kwargs))
+    _require_success(result, "Multi-view render")
+
+    path = result.get("filepath")
+    if not path or not os.path.exists(path):
+        raise ToolError(f"Multi-view render reported success but file not found: {path}")
+    _LAST_RENDER["path"] = path
+
+    names = result.get("views", [])
+    cols = int(result.get("columns") or 1)
+    grid = "\n".join(
+        "  " + " | ".join(names[i:i + cols]) for i in range(0, len(names), cols)
+    )
+    return _preview(
+        f"Contact sheet ({result.get('projection')}, {result.get('rows')}x{cols} grid of "
+        f"{'x'.join(str(v) for v in result.get('cell_size', []))} cells) framing "
+        f"[{', '.join(result.get('targets', []))}]:\n{grid}\nSaved to: {path}",
+        path,
+    )
+
+
+# =============================================================================
+# Snapshot & Diff Tools
+# =============================================================================
+
+
+class SnapshotInfo(TypedDict):
+    snapshot_id: str
+    label: str
+    object_count: int
+    frame_current: Optional[int]
+
+
+class SceneDiff(TypedDict):
+    snapshot_id: str
+    against: str
+    added: list[str]
+    removed: list[str]
+    changed: dict[str, dict[str, list]]
+    scene: dict[str, list]
+    summary: str
+
+
+async def _require_scene_state(client: BlenderClient) -> dict:
+    result = _unwrap(await client.call("scene_state", timeout=60.0))
+    _require_success(result, "Scene snapshot")
+    return result
+
+
+@mcp.tool(annotations=_READ_ONLY)
+async def blender_snapshot(label: str = "") -> SnapshotInfo:
+    """
+    Record the scene's current state and return a snapshot_id handle.
+
+    Pass the id to blender_diff later to see exactly what changed since -
+    after a batch of edits, a long blender_execute script, or to find out
+    what the user changed by hand in the GUI. Snapshots are cheap (a
+    compact fingerprint, not a .blend copy); the last 32 are kept.
+
+    Args:
+        label: Optional note to remember what this snapshot marks
+
+    Returns:
+        The snapshot_id and the scene size it captured
+    """
+    state = await _require_scene_state(get_blender())
+    snapshot_id = _SNAPSHOTS.add(state, label)
+    return {
+        "snapshot_id": snapshot_id,
+        "label": label,
+        "object_count": len(state.get("objects", {})),
+        "frame_current": state.get("scene", {}).get("frame_current"),
+    }
+
+
+@mcp.tool(annotations=_READ_ONLY)
+async def blender_diff(snapshot_id: str, against: Optional[str] = None) -> SceneDiff:
+    """
+    Compare a snapshot with the live scene (or with another snapshot).
+
+    Reports objects added and removed, and field-level changes: location,
+    rotation, scale, dimensions, visibility, parent, materials, modifiers,
+    collections, vertex/polygon counts, light power, camera lens, animation
+    action - plus scene settings (engine, resolution, fps, frame range,
+    active camera, world color).
+
+    Args:
+        snapshot_id: The earlier state, from blender_snapshot
+        against: A later snapshot_id to compare with (default: the live scene)
+
+    Returns:
+        Structured diff plus a compact text summary
+    """
+    base = _SNAPSHOTS.get(snapshot_id)
+    if base is None:
+        raise ToolError(
+            f"Unknown snapshot '{snapshot_id}'. Known: {', '.join(_SNAPSHOTS.ids()) or 'none'}"
+        )
+    if against:
+        other = _SNAPSHOTS.get(against)
+        if other is None:
+            raise ToolError(f"Unknown snapshot '{against}'")
+        after = other["state"]
+    else:
+        after = await _require_scene_state(get_blender())
+
+    diff = snapshots.diff_states(base["state"], after)
+    return {
+        "snapshot_id": snapshot_id,
+        "against": against or "live",
+        **diff,
+        "summary": snapshots.summarize(diff, after),
+    }
+
+
+# =============================================================================
+# Background Render Jobs
+# =============================================================================
+
+
+class JobStatus(TypedDict):
+    job_id: str
+    status: str
+    frames_done: int
+    frames_total: int
+    percent: float
+    frame_range: list[int]
+    last_frame: Optional[int]
+    elapsed_seconds: float
+    eta_seconds: Optional[float]
+    output: Optional[str]
+    frame_dir: str
+    error: Optional[str]
+
+
 @mcp.tool(annotations=_CAPTURE)
-async def blender_save(filepath: Optional[str] = None, copy: bool = False) -> str:
+async def blender_render_job_start(
+    frame_start: Optional[int] = None,
+    frame_end: Optional[int] = None,
+    frame_step: int = 1,
+    fps: Optional[int] = None,
+    engine: str = "BLENDER_EEVEE_NEXT",
+    samples: int = 64,
+    resolution_x: int = 1280,
+    resolution_y: int = 720,
+    container: Literal["MP4", "PNG"] = "MP4",
+    filepath: Optional[str] = None,
+) -> JobStatus:
+    """
+    Start rendering an animation in the BACKGROUND and return a job_id
+    immediately. Prefer this over blender_render_animation for anything
+    longer than a few seconds.
+
+    Frames render one at a time, so you can keep working while it runs
+    (your other tool calls slot in between frames), watch progress and
+    finished frames with blender_render_job_status, and stop it with
+    blender_render_job_cancel. Scene edits made while the job runs affect
+    the frames not yet rendered. MP4 output is encoded once all frames are
+    done; PNG keeps the frame sequence.
+
+    Args:
+        frame_start: First frame (default: scene frame range)
+        frame_end: Last frame (default: scene frame range)
+        frame_step: Render every Nth frame - e.g. 4 for a fast motion draft
+        fps: Video frame rate (default: scene fps, divided by frame_step)
+        engine: Render engine - 'BLENDER_EEVEE_NEXT' (fast) or 'CYCLES'
+        samples: Render samples per frame
+        resolution_x: Output width in pixels (even, for MP4)
+        resolution_y: Output height in pixels (even, for MP4)
+        container: 'MP4' for H.264 video, 'PNG' for the image sequence
+        filepath: Output .mp4 path (default: temp file)
+
+    Returns:
+        The job's initial status, including its job_id
+    """
+    busy = _JOBS.active()
+    if busy:
+        raise ToolError(
+            f"{busy[0].job_id} is still {busy[0].status}; wait for it "
+            "(blender_render_job_status) or cancel it first."
+        )
+    if container == "MP4" and (resolution_x % 2 or resolution_y % 2):
+        raise ToolError("MP4 (H.264) needs even resolution_x and resolution_y")
+    step = max(1, int(frame_step))
+
+    client = get_blender()
+    scene = None
+    if frame_start is None or frame_end is None or fps is None:
+        scene = _unwrap(await client.get_scene("minimal"))
+    start = int(frame_start if frame_start is not None else scene.get("frame_start", 1))
+    end = int(frame_end if frame_end is not None else scene.get("frame_end", start))
+    if end < start:
+        raise ToolError(f"frame_end {end} < frame_start {start}")
+    frames = list(range(start, end + 1, step))
+    if len(frames) > MAX_FRAMES:
+        raise ToolError(
+            f"{len(frames)} frames requested; capped at {MAX_FRAMES}. "
+            "Use a larger frame_step or a smaller range."
+        )
+    if fps is None:
+        fps = max(1, round(int(scene.get("fps", 24)) / step))
+
+    job = _JOBS.start(
+        client,
+        frames=frames,
+        fps=int(fps),
+        container=container,
+        output=filepath,
+        render_args={
+            "engine": engine,
+            "samples": int(samples),
+            "resolution_x": int(resolution_x),
+            "resolution_y": int(resolution_y),
+        },
+    )
+    return job.to_status()
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def blender_render_job_status(
+    ctx: Context,
+    job_id: Optional[str] = None,
+    wait_seconds: int = 0,
+    preview: Literal["auto", "latest", "sheet", "none"] = "auto",
+):
+    """
+    Check a background render job, optionally waiting for it to finish.
+
+    Use wait_seconds to long-poll instead of calling repeatedly: the call
+    returns as soon as the job finishes, or after the wait, reporting
+    progress notifications meanwhile.
+
+    Args:
+        job_id: The job to check (default: list all jobs, text only)
+        wait_seconds: Block up to this long for the job to finish (0-600)
+        preview: 'latest' = newest finished frame, 'sheet' = contact sheet
+                 of up to 8 frames spread over what's rendered so far,
+                 'auto' = latest while rendering, sheet once done,
+                 'none' = text only
+
+    Returns:
+        Status JSON (progress, ETA, output path) plus preview image(s)
+    """
+    if job_id is None:
+        jobs = _JOBS.all()
+        if not jobs:
+            return "No render jobs in this session."
+        return "\n".join(json.dumps(j.to_status()) for j in jobs)
+
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise ToolError(f"Unknown job '{job_id}'")
+
+    deadline = min(max(int(wait_seconds), 0), 600)
+    if deadline and job.status in ACTIVE and job.task is not None:
+        reported = -1
+        loop_start = asyncio.get_running_loop().time()
+        while job.status in ACTIVE:
+            remaining = deadline - (asyncio.get_running_loop().time() - loop_start)
+            if remaining <= 0:
+                break
+            if len(job.done) != reported:
+                reported = len(job.done)
+                await ctx.report_progress(
+                    reported, job.total, f"{job_id}: {reported}/{job.total} frames"
+                )
+            await asyncio.wait({job.task}, timeout=min(1.0, remaining))
+
+    status = job.to_status()
+    content: list = [json.dumps(status, indent=2)]
+
+    mode = preview
+    if mode == "auto":
+        mode = "sheet" if job.status not in ACTIVE else "latest"
+    if mode == "latest" and job.done:
+        frame, path, _ = job.done[-1]
+        if os.path.exists(path) and os.path.getsize(path) <= _MAX_INLINE_IMAGE_BYTES:
+            content += [f"Frame {frame}:", Image(path=path)]
+            _LAST_RENDER["path"] = path
+    elif mode == "sheet" and job.done:
+        picked = pick_evenly(job.done, 8)
+        sheet_path = os.path.join(job.frame_dir, "_contact_sheet.png")
+        response = await get_blender().call(
+            "contact_sheet", timeout=120.0,
+            paths=[p for _, p, _ in picked], filepath=sheet_path,
+            columns=min(4, len(picked)), cell_width=480,
+        )
+        result = response.get("result") if "error" not in response else None
+        if isinstance(result, dict) and result.get("success"):
+            frames = ", ".join(str(f) for f, _, _ in picked)
+            content += _preview(f"Frames {frames} (row-major from top-left):", sheet_path)
+            _LAST_RENDER["path"] = sheet_path
+        else:
+            content.append("(contact sheet unavailable)")
+    return content
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+async def blender_render_job_cancel(job_id: str) -> JobStatus:
+    """
+    Stop a background render job after the frame currently rendering.
+
+    Frames already rendered stay on disk in the job's frame_dir.
+
+    Args:
+        job_id: The job to cancel
+
+    Returns:
+        The job's status (status becomes 'cancelled' once the in-flight
+        frame finishes)
+    """
+    job = _JOBS.cancel(job_id)
+    if job is None:
+        raise ToolError(f"Unknown job '{job_id}'")
+    return job.to_status()
+
+
+# =============================================================================
+# Overwrite confirmation (multi-round-trip elicitation)
+# =============================================================================
+
+
+class OverwriteConfirmation(BaseModel):
+    overwrite: bool = Field(description="Replace the existing file")
+
+
+_PROCEED = OverwriteConfirmation(overwrite=True)
+
+
+def _client_can_elicit(ctx: Context) -> bool:
+    """True when the client declared form elicitation (a bare {} counts)."""
+    caps = ctx.client_capabilities
+    elicitation = caps.elicitation if caps is not None else None
+    return elicitation is not None and (elicitation.form is not None or elicitation.url is None)
+
+
+def _ask_overwrite(path: str) -> Elicit[OverwriteConfirmation]:
+    size_kb = os.path.getsize(path) / 1024
+    return Elicit(
+        f"'{path}' already exists ({size_kb:.1f} KB). Overwrite it?",
+        OverwriteConfirmation,
+    )
+
+
+async def _confirm_save_overwrite(ctx: Context, filepath: Optional[str] = None):
+    """Ask before a save replaces some OTHER existing .blend file.
+
+    Clients without elicitation keep the old behavior (overwrite), so this
+    never blocks a headless or older client.
+    """
+    if not filepath or not _client_can_elicit(ctx):
+        return _PROCEED
+    path = os.path.abspath(os.path.expanduser(filepath))
+    if not path.lower().endswith(".blend"):
+        path += ".blend"
+    if not os.path.isfile(path):
+        return _PROCEED
+    # Saving over the file that is already open is just a normal save.
+    try:
+        current = _unwrap(
+            await get_blender().execute("import bpy\n__result__ = bpy.data.filepath")
+        ).get("result")
+    except ToolError:
+        current = None
+    if current and os.path.abspath(str(current)) == path:
+        return _PROCEED
+    return _ask_overwrite(path)
+
+
+async def _confirm_export_overwrite(ctx: Context, filepath: str = ""):
+    """Ask before an export replaces an existing file."""
+    if not filepath or not _client_can_elicit(ctx):
+        return _PROCEED
+    path = os.path.abspath(os.path.expanduser(filepath))
+    return _ask_overwrite(path) if os.path.isfile(path) else _PROCEED
+
+
+def _overwrite_declined(confirm: ElicitationResult[OverwriteConfirmation]) -> bool:
+    return not (isinstance(confirm, AcceptedElicitation) and confirm.data.overwrite)
+
+
+@mcp.tool(annotations=_CAPTURE)
+async def blender_save(
+    filepath: Optional[str] = None,
+    copy: bool = False,
+    confirm: Annotated[
+        ElicitationResult[OverwriteConfirmation], Resolve(_confirm_save_overwrite)
+    ] = _PROCEED,
+) -> str:
     """
     Save the current .blend file. Do this after substantial scene work -
     nothing else persists the session.
+
+    Saving over a DIFFERENT existing .blend asks the user to confirm first
+    (on clients that support elicitation).
 
     Args:
         filepath: Where to save (a .blend path). Omit to save in place
@@ -703,6 +1209,11 @@ async def blender_save(filepath: Optional[str] = None, copy: bool = False) -> st
     Returns:
         Confirmation with the saved path and size
     """
+    if _overwrite_declined(confirm):
+        raise ToolError(
+            f"Not saved: the user declined to overwrite {filepath}. "
+            "Ask for a different filepath."
+        )
     client = get_blender()
     kwargs = {"copy": bool(copy)}
     if filepath:
@@ -822,9 +1333,14 @@ async def blender_export(
     filepath: str,
     format: Optional[str] = None,
     objects: Optional[list] = None,
+    confirm: Annotated[
+        ElicitationResult[OverwriteConfirmation], Resolve(_confirm_export_overwrite)
+    ] = _PROCEED,
 ) -> str:
     """
     Export the scene (or specific objects) to a 3D model file.
+    Replacing an existing file asks the user to confirm first (on clients
+    that support elicitation).
 
     Supported formats: obj, stl (3D printing), ply, fbx, gltf, glb (web/AR),
     usd/usda/usdc, dae, abc. Format comes from the file extension.
@@ -837,6 +1353,11 @@ async def blender_export(
     Returns:
         Export confirmation with path, object count and file size
     """
+    if _overwrite_declined(confirm):
+        raise ToolError(
+            f"Not exported: the user declined to overwrite {filepath}. "
+            "Ask for a different filepath."
+        )
     client = get_blender()
     kwargs = {"filepath": os.path.abspath(os.path.expanduser(filepath))}
     if format:
@@ -1696,8 +2217,11 @@ def turntable_animation(object_name: str, seconds: int = 4, fps: int = 24) -> st
         "(blender_organize action='parent').\n"
         f"4. Keyframe the empty's Z rotation with interpolation='LINEAR': "
         f"0 at frame 1, 2*pi at frame {frames} (blender_set_keyframe).\n"
-        "5. Take a screenshot at a mid frame to verify framing, then render "
-        "with blender_render_animation."
+        "5. Draft the motion: blender_render_job_start with frame_step=4 at "
+        "640x360, then blender_render_job_status with wait_seconds=120 and "
+        "check the contact sheet - is the subject framed all the way round?\n"
+        "6. Final: blender_render_job_start at full frame rate and "
+        "resolution; poll blender_render_job_status until 'completed'."
     )
 
 

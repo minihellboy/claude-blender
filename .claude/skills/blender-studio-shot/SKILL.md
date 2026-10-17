@@ -13,7 +13,8 @@ Produce a studio-quality hero shot of the object named in `$ARGUMENTS`
 
 1. **Verify the subject**: `blender_get_object` for its location and
    dimensions. Everything below scales from those dimensions (call the
-   largest dimension D).
+   largest dimension D). A quick `blender_render_views` shows its best side
+   before you commit to a camera angle.
 2. **Checkpoint**: `blender_checkpoint "studio shot setup"`.
 3. **Backdrop**: add a large plane (~10x D) under the subject; give it a
    smooth curved sweep behind the subject if the look calls for an infinity
@@ -34,5 +35,7 @@ Produce a studio-quality hero shot of the object named in `$ARGUMENTS`
    Backdrop seamless (no visible edges)? Adjust lights/camera and re-draft.
 7. **Final**: `blender_render` CYCLES, 1920x1080, 256 samples. If the user
    gave an output path, render straight to it.
+   `blender_save` / `blender_export` ask the user before replacing a
+   different existing file — if they decline, ask for a new path.
 8. Report the light setup you landed on (positions/powers) so it's
    reproducible, and show the final render.

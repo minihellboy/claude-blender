@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-blender"
-version = "0.4.0"
+version = "0.5.0"
 description = "Claude Code MCP server for Blender integration"
 readme = "README.md"
 license = {text = "MIT"}
@@ -26,7 +26,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=2.0.0,<3",
+    "mcp>=2.3.0,<3",
 ]
 
 [dependency-groups]

@@ -14,12 +14,15 @@ image, and adjusting — like a sculptor stepping back after every pass.
 1. **Inspect**: `blender_get_scene` (detailed) — know every object, light, and
    camera before touching anything.
 2. **Checkpoint**: `blender_checkpoint` with a label naming the round
-   (e.g. "iterate round 2"). If a round makes things worse, `blender_undo`
-   back to the checkpoint instead of stacking corrections on a mistake.
+   (e.g. "iterate round 2"), plus `blender_snapshot` so you can
+   `blender_diff` the round's net effect afterwards. If a round makes things
+   worse, `blender_undo` back to the checkpoint instead of stacking
+   corrections on a mistake.
 3. **Act**: make the changes for this round with dedicated tools
    (`blender_add_object`, `blender_create_material`, `blender_modifier`,
    `blender_frame_camera`, ...). Use `blender_execute` only for what they
-   can't do.
+   can't do — and read the scene diff it returns to confirm the code did
+   what you meant.
 4. **Draft render**: `blender_render` at 640x360, `BLENDER_EEVEE_NEXT`,
    32 samples. Never draft at full quality — a draft answers questions,
    it isn't the deliverable.
@@ -31,7 +34,9 @@ image, and adjusting — like a sculptor stepping back after every pass.
    - Materials: do surfaces read correctly (metal looks metal, glass glass)?
    - Mood: does it match the goal's adjectives?
    Write the critique down in one or two sentences before deciding the next
-   round's changes.
+   round's changes. When geometry changed, also check
+   `blender_render_views` (front/right/top/three-quarter in one image):
+   a single camera angle hides floating, sunken, or intersecting parts.
 6. Repeat until the draft matches the goal or 4 rounds are spent.
 
 ## Finish
