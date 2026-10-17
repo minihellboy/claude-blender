@@ -9,7 +9,7 @@ with integrations for text-to-3D, image-to-3D, AI textures, and more.
 bl_info = {
     "name": "Claude Blender",
     "author": "Claude Code",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Claude",
     "description": "AI-powered Blender control via Claude Code",
@@ -26,7 +26,7 @@ from .core.server import BlenderServer, get_server
 from .core.protocol import JSONRPCHandler
 from .core.executor import CommandExecutor
 from .core.scene_utils import SceneSerializer
-from .core import io_utils, camera_utils
+from .core import io_utils, camera_utils, visual_utils
 
 
 # Global instances
@@ -64,11 +64,15 @@ def _setup_handler():
         # Scene info
         'get_scene': lambda detail_level='basic': _scene_utils.get_scene_info(detail_level),
         'get_object': lambda name: _scene_utils.get_object_info(name),
+        'scene_state': lambda **kwargs: _scene_utils.scene_state(**kwargs),
 
         # Rendering
         'screenshot': lambda **kwargs: _scene_utils.capture_viewport(**kwargs),
         'render': lambda **kwargs: _scene_utils.render_image(**kwargs),
         'render_animation': lambda **kwargs: _scene_utils.render_animation(**kwargs),
+        'render_views': lambda **kwargs: visual_utils.render_views(**kwargs),
+        'contact_sheet': lambda **kwargs: visual_utils.contact_sheet(**kwargs),
+        'encode_video': lambda **kwargs: visual_utils.encode_video(**kwargs),
 
         # File
         'save_file': lambda **kwargs: _scene_utils.save_file(**kwargs),

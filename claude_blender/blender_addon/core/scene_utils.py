@@ -44,8 +44,15 @@ def _render_state(scene):
         r.image_settings.file_format = saved['file_format']
         r.filepath = saved['filepath']
         r.fps = saved['fps']
-        # An animation render walks the playhead to its last frame
-        scene.frame_current = saved['frame_current']
+        # An animation render walks the playhead to its last frame. frame_set
+        # (not a bare assignment) re-evaluates animation, so objects don't
+        # stay posed at the rendered frame.
+        if scene.frame_current != saved['frame_current']:
+            frame_set = getattr(scene, 'frame_set', None)
+            if frame_set is not None:
+                frame_set(saved['frame_current'])
+            else:
+                scene.frame_current = saved['frame_current']
         if cycles_samples is not None:
             scene.cycles.samples = cycles_samples
         if eevee_samples is not None:
@@ -209,7 +216,8 @@ class SceneSerializer:
         engine: Optional[str] = None,
         samples: Optional[int] = None,
         resolution_x: Optional[int] = None,
-        resolution_y: Optional[int] = None
+        resolution_y: Optional[int] = None,
+        frame: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Render the scene to an image.
@@ -220,6 +228,8 @@ class SceneSerializer:
             samples: Number of samples (for Cycles)
             resolution_x: Output width in pixels
             resolution_y: Output height in pixels
+            frame: Render this frame instead of the current one (the
+                   playhead is restored afterwards)
 
         Returns:
             Dict with filepath and success status
@@ -233,6 +243,9 @@ class SceneSerializer:
             # All parameters are per-call overrides; the user's settings
             # are restored afterwards, success or failure.
             with _render_state(scene):
+                if frame is not None:
+                    scene.frame_set(int(frame))
+
                 if engine:
                     scene.render.engine = engine
 
@@ -456,6 +469,75 @@ class SceneSerializer:
             }
         except Exception as e:
             return {'success': False, 'error': f'{type(e).__name__}: {e}'}
+
+    def scene_state(self, max_objects: int = 5000) -> Dict[str, Any]:
+        """
+        Compact, diffable fingerprint of the scene.
+
+        Everything is rounded so float noise never shows up as a change.
+        The MCP side stores these as snapshots and diffs them; the shape is
+        deliberately flat (field -> JSON value) to keep that diff generic.
+
+        Args:
+            max_objects: Refuse (rather than stall Blender) beyond this count
+
+        Returns:
+            Dict with 'scene' settings and per-object 'objects' state
+        """
+        scene = bpy.context.scene
+        objs = list(scene.objects)
+        if len(objs) > max_objects:
+            return {'success': False,
+                    'error': f'{len(objs)} objects exceeds max_objects={max_objects}'}
+
+        def r(values, nd=4):
+            return [round(float(v), nd) for v in values]
+
+        objects = {}
+        for obj in objs:
+            state = {
+                'type': obj.type,
+                'location': r(obj.location),
+                'rotation': r(obj.rotation_euler),
+                'scale': r(obj.scale),
+                'dimensions': r(obj.dimensions),
+                'hidden': bool(obj.hide_viewport or obj.hide_render),
+                'parent': obj.parent.name if obj.parent else None,
+                'data': obj.data.name if obj.data else None,
+                'materials': [s.material.name for s in obj.material_slots if s.material],
+                'modifiers': [f'{m.name}:{m.type}' for m in obj.modifiers],
+                'collections': sorted(c.name for c in obj.users_collection),
+            }
+            if obj.type == 'MESH' and obj.data:
+                state['vertices'] = len(obj.data.vertices)
+                state['polygons'] = len(obj.data.polygons)
+            elif obj.type == 'LIGHT' and obj.data:
+                state['light'] = f'{obj.data.type} {round(obj.data.energy, 2)}W'
+                state['light_color'] = r(obj.data.color, 3)
+            elif obj.type == 'CAMERA' and obj.data:
+                state['lens'] = round(obj.data.lens, 2)
+            anim = obj.animation_data
+            if anim and anim.action:
+                state['action'] = anim.action.name
+            objects[obj.name] = state
+
+        render = scene.render
+        settings = {
+            'engine': render.engine,
+            'resolution': [render.resolution_x, render.resolution_y],
+            'fps': render.fps,
+            'frame_range': [scene.frame_start, scene.frame_end],
+            'frame_current': scene.frame_current,
+            'camera': scene.camera.name if scene.camera else None,
+            'world': scene.world.name if scene.world else None,
+            'materials': len(bpy.data.materials),
+        }
+        world = self._get_world_info()
+        if world and 'background_color' in world:
+            settings['world_color'] = r(world['background_color'], 3)
+            settings['world_strength'] = round(float(world['background_strength']), 3)
+
+        return {'success': True, 'scene': settings, 'objects': objects}
 
     def _get_objects_list(self, scene, detail_level: str) -> List[Dict]:
         """Get list of objects in the scene."""

@@ -11,7 +11,7 @@ from claude_blender_mcp import blender_client
 from claude_blender_mcp import server as srv
 
 
-EXPECTED_TOOL_COUNT = 28
+EXPECTED_TOOL_COUNT = 34
 
 
 def _image_contents(result):

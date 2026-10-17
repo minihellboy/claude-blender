@@ -10,7 +10,9 @@ MCP client (Claude Code)
    │  stdio, MCP protocol 2026-07-28 (SDK v2, stateless)
    ▼
 claude_blender/claude_blender_mcp/     ← runs OUTSIDE Blender (uv project)
-   server.py          28 tools, 3 resources, 2 prompts (MCPServer)
+   server.py          34 tools, 3 resources, 2 prompts (MCPServer)
+   render_jobs.py     background frame-by-frame render jobs (job handles)
+   snapshots.py       scene fingerprints → snapshot handles + diffs
    blender_client.py  async JSON-RPC client, per-call timeouts
    │  newline-delimited JSON-RPC 2.0 over TCP 127.0.0.1:9876
    ▼
@@ -18,7 +20,8 @@ claude_blender/blender_addon/          ← runs INSIDE Blender (addon)
    core/server.py       timer-polled TCP server (60 Hz, buffered writes)
    core/protocol.py     JSON-RPC dispatch → registered methods
    core/executor.py     exec/operators/modifiers/duplicate/undo
-   core/scene_utils.py  introspection, render, render_animation
+   core/scene_utils.py  introspection, scene_state, render, render_animation
+   core/visual_utils.py render_views, contact_sheet, encode_video
    core/io_utils.py     import/export (format from extension)
    core/camera_utils.py frame_camera (pure-math fit, headless-safe)
    __init__.py          _setup_handler() registers every RPC method
@@ -54,6 +57,14 @@ claude_blender/blender_addon/          ← runs INSIDE Blender (addon)
    (`.claude/skills/`), the examples (`examples/`), and the README tool
    tables — they intentionally describe the same workflows at different
    depths, and drift between them misleads agents.
+9. **State lives in handles, not sessions.** MCP 2026-07-28 is stateless;
+   anything a later call needs (snapshots, render jobs) is minted as an id
+   the model passes back. Both stores are process-local and bounded. A
+   multi-replica HTTP deployment would need a shared store.
+10. **Elicitation degrades gracefully.** `Resolve` resolvers must return a
+    plain value (never `Elicit`) when the client lacks the elicitation
+    capability (`_client_can_elicit`), so older or headless clients are never
+    blocked.
 
 ## Commands
 

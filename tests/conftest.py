@@ -74,6 +74,18 @@ class FakeBlender:
         self.server: asyncio.AbstractServer | None = None
         self.received_code: list[str] = []
         self.calls: list[tuple[str, dict]] = []
+        # scene_state fingerprint; tests mutate it (or set state_after_execute)
+        # to simulate what generated code did to the scene.
+        self.state = {
+            "success": True,
+            "scene": {"engine": "BLENDER_EEVEE_NEXT", "fps": 24, "frame_current": 1},
+            "objects": {
+                "Cube": {"type": "MESH", "location": [0, 0, 0], "materials": ["Mat"]},
+                "Light": {"type": "LIGHT", "location": [4, 1, 6]},
+            },
+        }
+        self.state_after_execute: dict | None = None
+        self.render_delay = 0.0
         self.screenshot_path = os.path.join(
             tempfile.gettempdir(), f"fake_blender_shot_{port}.png"
         )
@@ -131,6 +143,9 @@ class FakeBlender:
         # Execute like the real executor does - a payload that only compiles
         # can still crash at runtime (wrong imports, bad attribute paths).
         namespace = {"__result__": None}
+        if self.state_after_execute is not None:
+            self.state = self.state_after_execute
+            self.state_after_execute = None
         try:
             exec(compiled, namespace)
         except Exception as e:
@@ -144,6 +159,7 @@ class FakeBlender:
     def _h_get_scene(self, params):
         return {
             "name": "Scene", "object_count": 2, "active_object": "Cube",
+            "frame_current": 1, "frame_start": 1, "frame_end": 48, "fps": 24,
             "objects": [{"name": "Cube", "type": "MESH"}, "Light"],
         }
 
@@ -157,6 +173,10 @@ class FakeBlender:
             "modifiers": [{"name": "Subsurf", "type": "SUBSURF", "show_viewport": True}],
             "collections": ["Collection"],
         }
+
+    def _h_scene_state(self, params):
+        import copy
+        return copy.deepcopy(self.state)
 
     def _h_add_object(self, params):
         return {"success": True, "object_name": params.get("name", "Cube")}
@@ -174,13 +194,49 @@ class FakeBlender:
     def _h_screenshot(self, params):
         return {"success": True, "filepath": self.screenshot_path}
 
-    def _h_render(self, params):
+    async def _h_render(self, params):
+        if self.render_delay:
+            await asyncio.sleep(self.render_delay)
         path = params.get("filepath") or os.path.join(
             tempfile.gettempdir(), f"fake_blender_render_{self.port}.png"
         )
         with open(path, "wb") as f:
             f.write(PNG_BYTES)
         return {"success": True, "filepath": path}
+
+    def _h_render_views(self, params):
+        views = params.get("views") or ["front", "right", "top", "three_quarter"]
+        path = params.get("filepath") or os.path.join(
+            tempfile.gettempdir(), f"fake_blender_views_{self.port}.png"
+        )
+        with open(path, "wb") as f:
+            f.write(PNG_BYTES)
+        cols = params.get("columns") or 2
+        return {
+            "success": True, "filepath": path, "columns": cols,
+            "rows": -(-len(views) // cols), "cell_size": [480, 360], "size": [972, 732],
+            "views": [v if isinstance(v, str) else v["name"] for v in views],
+            "targets": params.get("targets", ["Cube"]),
+            "projection": "ORTHO" if params.get("ortho") else "PERSP",
+        }
+
+    def _h_contact_sheet(self, params):
+        missing = [p for p in params["paths"] if not os.path.isfile(p)]
+        if missing:
+            return {"success": False, "error": f"Images not found: {missing}"}
+        with open(params["filepath"], "wb") as f:
+            f.write(PNG_BYTES)
+        return {"success": True, "filepath": params["filepath"],
+                "columns": params.get("columns", 1), "rows": 1}
+
+    def _h_encode_video(self, params):
+        missing = [p for p in params["frame_paths"] if not os.path.isfile(p)]
+        if missing:
+            return {"success": False, "error": f"Frames not found: {missing}"}
+        with open(params["filepath"], "wb") as f:
+            f.write(b"\x00" * 64)  # stub video
+        return {"success": True, "filepath": params["filepath"],
+                "frame_count": len(params["frame_paths"]), "fps": params.get("fps", 24)}
 
     def _h_save_file(self, params):
         path = params.get("filepath") or os.path.join(

@@ -54,6 +54,11 @@ The result: [turntable.mp4](images/turntable.mp4)
 (EEVEE renders the copper darker than the Cycles product shot — fine for
 motion checks; re-render with `engine="CYCLES"` for the final.)
 
+For anything longer than a quick draft, render it as a background job
+instead: `blender_render_job_start` returns at once, and
+`blender_render_job_status` reports progress, the ETA and preview frames
+(see [04 – Review & background jobs](04-review-and-jobs.md)).
+
 Try it in this repo:
 
 ```

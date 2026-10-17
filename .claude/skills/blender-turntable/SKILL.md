@@ -22,13 +22,17 @@ Create a 360° turntable of the object in `$ARGUMENTS`
    `interpolation="LINEAR"`: 0 at frame 1, 2π at the last frame. LINEAR
    keeps the spin constant-speed - the default Bezier easing makes a looping
    turntable stutter at the seam.
-5. **Preview**: `blender_screenshot` at frames 1 and midway (set the frame
-   via `blender_execute` frame_set) — verify the subject stays framed all
-   the way around. Off-center subjects orbit out of frame; re-center the
-   empty if so.
-6. **Render**: `blender_render_animation` — EEVEE_NEXT for speed (CYCLES only
-   if the user asks for quality), 1280x720, `preview_frames` 3. Inspect the
-   returned preview stills: consistent framing? lighting stable through the
-   rotation?
-7. Report the video path and the preview stills. Offer a Cycles re-render at
+5. **Motion draft**: `blender_render_job_start` with `frame_step` 4,
+   640x360, EEVEE_NEXT, then `blender_render_job_status` with
+   `wait_seconds` 120. The returned contact sheet spans the whole orbit —
+   verify the subject stays framed all the way around. Off-center subjects
+   orbit out of frame; re-center the empty if so.
+6. **Render**: `blender_render_job_start` at the full frame rate,
+   1280x720 — EEVEE_NEXT for speed (CYCLES only if the user asks for
+   quality). It runs in the background: tell the user the job_id and ETA,
+   long-poll `blender_render_job_status` (`wait_seconds` up to 600) until
+   `completed`, and `blender_render_job_cancel` if a preview frame shows a
+   problem. Inspect the final contact sheet: consistent framing? lighting
+   stable through the rotation?
+7. Report the video path and the contact sheet. Offer a Cycles re-render at
    higher resolution if the user wants final quality.

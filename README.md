@@ -13,8 +13,12 @@ Control Blender through natural language, execute Python scripts, generate 3D co
 
 ### Core Features
 - **Natural Language Control**: Control Blender via Claude Code commands
-- **MCP Integration**: Built on MCP SDK v2 (protocol 2026-07-28) — 28 tools, 3 resources, and workflow prompts, with tool annotations and structured output
+- **MCP Integration**: Built on MCP SDK v2.3 (protocol 2026-07-28) — 34 tools, 3 resources, and workflow prompts, with tool annotations, structured output, and multi-round-trip elicitation
 - **Visual Feedback Loop**: Screenshots and renders come back inline so Claude can see, critique, and iterate on its own work
+- **Multi-View Review**: One call renders front/side/top/¾ views into a single contact sheet, which catches floating or intersecting parts that one camera angle hides
+- **Scene Diffs**: Every `blender_execute` reports exactly what it changed; snapshot/diff tools compare any two points in a session (including the user's own GUI edits)
+- **Background Render Jobs**: Animations render frame-by-frame in the background with progress, ETA, preview frames, and cancel, so Claude keeps working while it renders
+- **Overwrite Confirmation**: Save/export ask the user before replacing an existing file (on clients that support elicitation)
 - **Import / Export**: OBJ, STL, PLY, FBX, glTF/GLB, USD, Collada, Alembic
 - **Animation Rendering**: MP4 turntables and image sequences with inline preview stills
 - **Camera Framing**: One call positions and aims a camera to frame any object
@@ -104,7 +108,7 @@ preferences; the toggle takes effect immediately).
 
 ### 2. Install the MCP Server
 
-This is a uv project (root `pyproject.toml` + `uv.lock`, built on `mcp>=2.0.0`, MCP protocol revision 2026-07-28). From the repo root:
+This is a uv project (root `pyproject.toml` + `uv.lock`, built on `mcp>=2.3.0`, MCP protocol revision 2026-07-28). From the repo root:
 
 ```bash
 uv sync
@@ -229,15 +233,29 @@ uv run python claude_blender/test_client.py -i
 ### Code Execution
 | Tool | Description |
 |------|-------------|
-| `blender_execute` | Execute arbitrary Python code in Blender |
+| `blender_execute` | Execute arbitrary Python code in Blender — the result ends with a diff of what the code changed in the scene |
 
 ### Rendering
 | Tool | Description |
 |------|-------------|
 | `blender_screenshot` | Capture viewport — returns the image inline so Claude can see it |
 | `blender_render` | Render scene — defaults are a fast draft; renders never leak settings into the scene |
-| `blender_render_animation` | Render MP4 video or PNG sequence — returns preview stills inline |
-| `blender_save` | Save the .blend file (in place or as a copy) |
+| `blender_render_animation` | Render MP4 video or PNG sequence (blocking) — returns preview stills inline |
+| `blender_render_views` | Multi-angle contact sheet (front/right/top/¾, ortho optional) in one image, via a temporary camera |
+| `blender_save` | Save the .blend file (in place or as a copy); asks before overwriting a different existing file |
+
+### Background Render Jobs
+| Tool | Description |
+|------|-------------|
+| `blender_render_job_start` | Start a background animation render (MP4 or PNG, `frame_step` for drafts); returns a `job_id` immediately |
+| `blender_render_job_status` | Progress, ETA, newest frame or contact sheet; `wait_seconds` long-polls with progress notifications |
+| `blender_render_job_cancel` | Stop after the in-flight frame; finished frames stay on disk |
+
+### Snapshots & Diff
+| Tool | Description |
+|------|-------------|
+| `blender_snapshot` | Record a compact scene fingerprint and return a `snapshot_id` |
+| `blender_diff` | Field-level diff of a snapshot vs the live scene (or another snapshot): objects added/removed, transforms, materials, modifiers, settings |
 
 ### Camera
 | Tool | Description |
@@ -248,7 +266,7 @@ uv run python claude_blender/test_client.py -i
 | Tool | Description |
 |------|-------------|
 | `blender_import_model` | Import OBJ, STL, PLY, FBX, glTF/GLB, USD, DAE, ABC |
-| `blender_export` | Export scene or selected objects to any of the above |
+| `blender_export` | Export scene or selected objects to any of the above; asks before overwriting an existing file |
 
 ### Modifiers & Organization
 | Tool | Description |
@@ -332,7 +350,8 @@ claude-blender/
 │   │   │   ├── executor.py      # Objects, modifiers, duplicate, undo
 │   │   │   ├── scene_utils.py   # Introspection, render, render_animation
 │   │   │   ├── io_utils.py      # Import/export (format from extension)
-│   │   │   └── camera_utils.py  # frame_camera fit math (headless-safe)
+│   │   │   ├── camera_utils.py  # frame_camera fit math (headless-safe)
+│   │   │   └── visual_utils.py  # Multi-view sheets, contact sheets, MP4 encoding
 │   │   └── ai_services/
 │   │       ├── base.py          # Base service classes
 │   │       ├── local_text_to_3d.py    # Shap-E, Point-E, Procedural
@@ -341,7 +360,9 @@ claude-blender/
 │   │
 │   ├── claude_blender_mcp/
 │   │   ├── __init__.py          # MCP entry point
-│   │   ├── server.py            # MCPServer (MCP SDK v2): 27 tools, resources, prompts
+│   │   ├── server.py            # MCPServer (MCP SDK v2): 34 tools, resources, prompts
+│   │   ├── render_jobs.py       # Background frame-by-frame render jobs
+│   │   ├── snapshots.py         # Scene snapshots and diffs
 │   │   └── blender_client.py    # Async Blender client
 │   │
 │   ├── test_client.py           # Raw JSON-RPC test script
